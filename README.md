@@ -338,8 +338,8 @@ use spare capacity in the same pool and are evicted when live requests need it.
 ## Public surface
 
 The top-level `resin` package exposes the Engine, immutable plans and request
-policies, runner protocols, cache layouts, and metrics types. See
-[`resin/__init__.py`](resin/__init__.py) for the current exports and
+policies, runner protocols, cache layouts and storage interfaces, and metrics
+types. See [`resin/__init__.py`](resin/__init__.py) for the current exports and
 [`resin/protocols.py`](resin/protocols.py) for the runner contracts.
 
 Distributed coordination lives in `resin.backend.distributed`, with explicit
