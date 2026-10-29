@@ -99,13 +99,35 @@ def moe_align_block_size(
 if _HAS_TRITON:
 
     @triton.jit
-    def _e2m1_nibble_to_e4m3(nib):
-        """E2M1 4-bit code -> E4M3 byte bits (uint8, exact re-encoding)."""
-        nib = nib.to(tl.uint8)
+    def _e2m1_nibble_to_f16(nib):
+        """E2M1 4-bit code -> exact FP16 value (values are 0/.5/1/1.5/2/3/4/6)."""
         mag = (nib & 0x7).to(tl.int32)
-        bits = tl.where(mag == 0, 0, tl.where(mag == 1, 0x30, 0x30 + (mag << 2)))
-        bits = bits | ((nib & 0x8).to(tl.int32) << 4)
-        return bits.to(tl.uint8)
+        value = tl.where(
+            mag == 0, 0.0,
+            tl.where(
+                mag == 1, 0.5,
+                tl.where(
+                    mag == 2, 1.0,
+                    tl.where(
+                        mag == 3, 1.5,
+                        tl.where(
+                            mag == 4, 2.0,
+                            tl.where(mag == 5, 3.0, tl.where(mag == 6, 4.0, 6.0)),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        value = tl.where((nib & 0x8) != 0, -value, value)
+        return value.to(tl.float16)
+
+    @triton.jit
+    def _exp2_from_ue8m0(byte):
+        """UE8M0 byte -> exact power of two in fp32 via IEEE bit assembly."""
+        e = (byte.to(tl.int32) - 127)
+        e = tl.minimum(tl.maximum(e, -126), 127)
+        bits = ((e + 127) << 23).to(tl.uint32)
+        return bits.to(tl.float32, bitcast=True)
 
     @triton.jit
     def _grouped_w4a8_gemm(
@@ -138,36 +160,35 @@ if _HAS_TRITON:
 
         for kb in range(0, K // 32):
             k_base = kb * 32
+            # Activation block: E4M3 values scaled by 2^(ea - 127), folded in
+            # FP16 (powers of two are exact) so one dot covers the block.
             a = tl.load(
                 A + tok[:, None] * stride_am + (k_base + offs_k)[None, :] * stride_ak,
                 mask=m_mask[:, None], other=0.0,
+            ).to(tl.float16)
+            ea = tl.load(
+                A_SCALE + tok * stride_sm + kb * stride_sk,
+                mask=m_mask, other=127,
             )
+            a = a * _exp2_from_ue8m0(ea)[:, None].to(tl.float16)
 
+            # Weight block: unpack E2M1 nibbles (even k = low nibble), fold the
+            # row scale, then one FP16 dot into FP32 accumulators.
             pb = tl.load(
                 B + expert * stride_be + offs_n[:, None] * stride_bn
                 + (kb * 16 + offs_k16)[None, :] * stride_bk,
                 mask=n_mask[:, None], other=0,
             )
-            lo = _e2m1_nibble_to_e4m3(pb & 0x0F)
-            hi = _e2m1_nibble_to_e4m3(pb >> 4)
-            # Even k lives in the low nibble: interleave restores the K order,
-            # and one K=32 dot satisfies tl.dot's K >= 32 requirement.
-            w8 = tl.interleave(lo, hi).to(tl.float8e4nv, bitcast=True)
-
-            partial = tl.dot(a, tl.trans(w8), out_dtype=tl.float32)
-
-            ea = tl.load(
-                A_SCALE + tok * stride_sm + kb * stride_sk,
-                mask=m_mask, other=127,
-            ).to(tl.int32)
+            lo = _e2m1_nibble_to_f16(pb & 0x0F)
+            hi = _e2m1_nibble_to_f16(pb >> 4)
+            w = tl.interleave(lo, hi)
             ew = tl.load(
                 B_SCALE + expert * stride_se + offs_n * stride_sn + kb,
                 mask=n_mask, other=127,
-            ).to(tl.int32)
-            e_pow = ea[:, None] + ew[None, :] - 254
-            e_pow = tl.minimum(tl.maximum(e_pow, -126), 127)
-            scale = ((e_pow + 127) << 23).to(tl.uint32).to(tl.float32, bitcast=True)
-            acc += partial * scale
+            )
+            w = w * _exp2_from_ue8m0(ew)[:, None].to(tl.float16)
+
+            acc += tl.dot(a, tl.trans(w), out_dtype=tl.float32)
 
         tl.store(
             C + tok[:, None] * stride_cm + offs_n[None, :] * stride_cn,

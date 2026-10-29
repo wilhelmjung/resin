@@ -120,7 +120,7 @@ def test_l1_single_expert_gemm_parity():
     )
 
     w_ref = dequant_expert(packed[0], scale[0]).float()
-    ref = x_ref @ w_ref.t()
+    ref = x_ref.cpu() @ w_ref.t()
     cos = torch.nn.functional.cosine_similarity(out.flatten(), ref.flatten(), dim=0)
     rel = (out - ref).norm() / ref.norm()
     assert cos.item() >= 0.99995, cos.item()
