@@ -36,7 +36,14 @@ def _lookup(
     tl.store(output + row * DIM + column, value * scale, mask=column < DIM)
 
 
-def fp8_embedding(indices, weight, scales, start, stop, output=None):
+def fp8_embedding(
+    indices: torch.Tensor,
+    weight: torch.Tensor,
+    scales: torch.Tensor,
+    start: int,
+    stop: int,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor:
     indices = indices.contiguous()
     if output is None:
         output = torch.empty(
