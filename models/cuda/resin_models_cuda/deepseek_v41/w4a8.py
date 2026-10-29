@@ -124,6 +124,7 @@ if _HAS_TRITON:
         expert = tl.load(expert_ids + pid_m).to(tl.int64)
         offs_m = tl.arange(0, BLOCK_M)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, 32)
         offs_k16 = tl.arange(0, 16)
 
         tok = tl.load(sorted_token_ids + pid_m * BLOCK_M + offs_m)
@@ -134,12 +135,8 @@ if _HAS_TRITON:
 
         for kb in range(0, K // 32):
             k_base = kb * 32
-            a_even = tl.load(
-                A + tok[:, None] * stride_am + (k_base + 2 * offs_k16)[None, :] * stride_ak,
-                mask=m_mask[:, None], other=0.0,
-            )
-            a_odd = tl.load(
-                A + tok[:, None] * stride_am + (k_base + 2 * offs_k16 + 1)[None, :] * stride_ak,
+            a = tl.load(
+                A + tok[:, None] * stride_am + (k_base + offs_k)[None, :] * stride_ak,
                 mask=m_mask[:, None], other=0.0,
             )
 
@@ -148,11 +145,13 @@ if _HAS_TRITON:
                 + (kb * 16 + offs_k16)[None, :] * stride_bk,
                 mask=n_mask[:, None], other=0,
             )
-            lo = _e2m1_nibble_to_e4m3(pb & 0x0F).to(tl.float8e4nv, bitcast=True)
-            hi = _e2m1_nibble_to_e4m3(pb >> 4).to(tl.float8e4nv, bitcast=True)
+            lo = _e2m1_nibble_to_e4m3(pb & 0x0F)
+            hi = _e2m1_nibble_to_e4m3(pb >> 4)
+            # Even k lives in the low nibble: interleave restores the K order,
+            # and one K=32 dot satisfies tl.dot's K >= 32 requirement.
+            w8 = tl.interleave(lo, hi).to(tl.float8e4nv, bitcast=True)
 
-            partial = tl.dot(a_even, tl.trans(lo), out_dtype=tl.float32)
-            partial += tl.dot(a_odd, tl.trans(hi), out_dtype=tl.float32)
+            partial = tl.dot(a, tl.trans(w8), out_dtype=tl.float32)
 
             ea = tl.load(
                 A_SCALE + tok * stride_sm + kb * stride_sk,
