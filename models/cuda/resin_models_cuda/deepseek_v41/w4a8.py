@@ -100,9 +100,12 @@ if _HAS_TRITON:
 
     @triton.jit
     def _e2m1_nibble_to_e4m3(nib):
-        mag = nib & 0x7
+        """E2M1 4-bit code -> E4M3 byte bits (uint8, exact re-encoding)."""
+        nib = nib.to(tl.uint8)
+        mag = (nib & 0x7).to(tl.int32)
         bits = tl.where(mag == 0, 0, tl.where(mag == 1, 0x30, 0x30 + (mag << 2)))
-        return bits | ((nib & 0x8) << 4)
+        bits = bits | ((nib & 0x8).to(tl.int32) << 4)
+        return bits.to(tl.uint8)
 
     @triton.jit
     def _grouped_w4a8_gemm(

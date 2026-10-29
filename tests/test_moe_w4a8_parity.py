@@ -100,7 +100,7 @@ def test_act_quant_matches_power_of_two_blocks():
 def test_l1_single_expert_gemm_parity():
     n, k, rows = 128, 256, 7
     packed, scale = synthetic_expert_weights(1, n, k, seed=1)
-    packed, scale = packed.cuda(), scale.cuda()
+    packed_gpu, scale_gpu = packed.cuda(), scale.cuda()
 
     x = torch.randn(rows, k, dtype=torch.bfloat16) * 0.7
     a_q, a_s = act_quant_mxfp8(x.cuda(), 32)
@@ -115,7 +115,7 @@ def test_l1_single_expert_gemm_parity():
     num_post = torch.tensor(16, dtype=torch.int32, device="cuda")
 
     out = grouped_w4a8_gemm(
-        a_q, a_s, packed, scale, sorted_ids, expert_ids, num_post,
+        a_q, a_s, packed_gpu, scale_gpu, sorted_ids, expert_ids, num_post,
         block_m=16, block_n=64,
     )
 
