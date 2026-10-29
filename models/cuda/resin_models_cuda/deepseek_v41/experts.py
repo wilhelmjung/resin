@@ -348,6 +348,27 @@ class RoutedExperts(nn.Module):
             return torch.zeros_like(
                 hidden, dtype=torch.float32 if self.dispatch else hidden.dtype
             )
+        if not self.fused:
+            # Dense (mini-checkpoint BF16) experts: correctness-first loop over
+            # the experts selected per routing slot; production keeps FP4 below.
+            out = torch.zeros(
+                hidden.shape[0],
+                hidden.shape[-1],
+                dtype=torch.float32,
+                device=hidden.device,
+            )
+            flat_weights = weights.float().flatten()
+            for slot in range(indices.shape[-1]):
+                for expert in torch.unique(indices[:, slot]).tolist():
+                    if not self.start <= expert < self.stop:
+                        continue
+                    rows = (indices[:, slot] == expert).nonzero(as_tuple=True)[0]
+                    local = int(expert - self.start)
+                    value = self.experts[local](
+                        hidden[rows], flat_weights[rows, slot][:, None]
+                    )
+                    out.index_add_(0, rows, value.float())
+            return out
         quantized, scales = act_quant(hidden, 32, "ue8m0", torch.float8_e8m0fnu)
         partial = fp4_fused_moe(
             quantized,

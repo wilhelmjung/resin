@@ -117,8 +117,8 @@ class DeepSeekV41Config:
             raise ValueError("invalid DeepSeek-V4.1 attention geometry")
         if self.num_key_value_heads != 1:
             raise ValueError("DeepSeek-V4.1 MLA requires one KV head")
-        if self.expert_dtype != "fp4":
-            raise ValueError("DeepSeek-V4.1 requires FP4 experts")
+        if self.expert_dtype not in ("fp4", None):
+            raise ValueError("DeepSeek-V4.1 requires FP4 or dense BF16 experts")
         if len(self.compress_ratios) < self.num_hidden_layers or any(
             r not in (0, 1, 2) for r in self.compress_ratios
         ):

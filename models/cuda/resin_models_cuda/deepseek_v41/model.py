@@ -303,25 +303,37 @@ class Attention(nn.Module):
         )
         self.window_size, self.ratio = args.window_size, args.compress_ratios[layer]
         self.o_lora_rank, self.softmax_scale = args.o_lora_rank, args.head_dim**-0.5
+        # Dense projections honor ModelArgs.dtype so a BF16 mini checkpoint
+        # exercises the engine pipeline without the FP8/UE8M0 scale path.
+        attn_dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
         self.wq_a, self.wkv = (
-            Linear(args.dim, args.q_lora_rank),
-            Linear(args.dim, args.head_dim),
+            Linear(args.dim, args.q_lora_rank, dtype=attn_dtype),
+            Linear(args.dim, args.head_dim, dtype=attn_dtype),
         )
         self.q_norm, self.kv_norm = (
             RMSNorm(args.q_lora_rank, args.norm_eps),
             RMSNorm(args.head_dim, args.norm_eps),
         )
         self.wq_b = Linear(
-            args.q_lora_rank, args.n_heads * args.head_dim, tensor_parallel=tp, axis=0
+            args.q_lora_rank,
+            args.n_heads * args.head_dim,
+            dtype=attn_dtype,
+            tensor_parallel=tp,
+            axis=0,
         )
         self.wo_a = Linear(
             args.n_heads * args.head_dim // args.o_groups,
             args.o_groups * args.o_lora_rank,
+            dtype=attn_dtype,
             tensor_parallel=tp,
             axis=0,
         )
         self.wo_b = Linear(
-            args.o_groups * args.o_lora_rank, args.dim, tensor_parallel=tp, axis=1
+            args.o_groups * args.o_lora_rank,
+            args.dim,
+            dtype=attn_dtype,
+            tensor_parallel=tp,
+            axis=1,
         )
         self.attn_sink = nn.Parameter(
             torch.empty(self.n_local_heads, dtype=torch.float32)
@@ -779,7 +791,9 @@ class Transformer(nn.Module):
         if self.mtp:
             first, last = self.mtp[0], self.mtp[-1]
             first.main_proj = Linear(
-                args.dim * len(args.dspark_target_layer_ids), args.dim
+                args.dim * len(args.dspark_target_layer_ids),
+                args.dim,
+                dtype=torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16,
             )
             first.main_norm = RMSNorm(args.dim, args.norm_eps)
             last.norm = RMSNorm(args.dim, args.norm_eps)
