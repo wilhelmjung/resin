@@ -181,6 +181,9 @@ class MiniPlan:
         text["engram_layer_ids"] = self.engram_layers
         text["engram_num_embeddings"] = [self.engram_rows] if self.engram_rows else []
         text["candidate_source_layer_id"] = len(self.src_layers) - 1
+        text["dspark_target_layer_ids"] = (
+            [len(self.src_layers) - 1] if self.mtp else []
+        )
         if self.fmt == "bf16":
             cfg["quantization_config"]["expert_dtype"] = None
         return cfg
@@ -200,6 +203,7 @@ class MiniPlan:
             kv_source_layers=[2, 3],
             index_source_layers=[2, 3],
             candidate_source_layer=len(self.src_layers) - 1,
+            vision_n_layers=0,
             compress_ratios=[0, 0, 2, 1] + ([0] if self.mtp else []),
         )
         if self.fmt == "bf16":

@@ -214,9 +214,10 @@ class PreparedVocabHead(PreparedLinear):
 class SharedExpert(nn.Module):
     def __init__(self, args):
         super().__init__()
-        self.w1 = Linear(args.dim, args.moe_inter_dim)
-        self.w2 = Linear(args.moe_inter_dim, args.dim)
-        self.w3 = Linear(args.dim, args.moe_inter_dim)
+        dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
+        self.w1 = Linear(args.dim, args.moe_inter_dim, dtype=dtype)
+        self.w2 = Linear(args.moe_inter_dim, args.dim, dtype=dtype)
+        self.w3 = Linear(args.dim, args.moe_inter_dim, dtype=dtype)
         self.limit = args.swiglu_limit
 
     def forward(self, value):
