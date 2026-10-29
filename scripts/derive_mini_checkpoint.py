@@ -102,7 +102,8 @@ class MiniPlan:
     """Name mapping and config surgery for one derivation run."""
 
     def __init__(self, src: Path, src_layers: list[int], n_experts: int,
-                 engram_vocab: int, fmt: str, mtp: bool):
+                 engram_vocab: int, fmt: str, mtp: bool, vision: bool = False):
+        self.vision = vision
         self.src, self.src_layers = src, src_layers
         self.n_experts, self.engram_vocab, self.fmt, self.mtp = (
             n_experts, engram_vocab, fmt, mtp,
@@ -137,6 +138,8 @@ class MiniPlan:
             return None
         parts[1] = str(self.layer_map[layer])
         name = ".".join(parts)
+        if not self.vision and name.endswith(".bias_vl"):
+            return None  # the vision-gated gate bias is unused without ViT
         limit = None
         if ".ffn.gate." in key:
             limit = self.n_experts
@@ -242,6 +245,7 @@ def main() -> int:
     ap.add_argument("--engram-vocab", type=int, default=1_000_000)
     ap.add_argument("--format", choices=("bf16", "native"), default="bf16")
     ap.add_argument("--mtp", type=int, default=0)
+    ap.add_argument("--vision", type=int, default=0)
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -254,7 +258,7 @@ def main() -> int:
 
     plan = MiniPlan(src, [int(x) for x in args.src_layers.split(",")],
                     args.n_routed_experts, args.engram_vocab,
-                    args.format, bool(args.mtp))
+                    args.format, bool(args.mtp), bool(args.vision))
 
     # Hard self-check of the documented 1M-vocab bucket sum (doc section 4.2).
     assert engram_rows(1_000_000, 1, plan.ngram, plan.e_heads)[0] == 24_003_916
