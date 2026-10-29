@@ -122,14 +122,6 @@ if _HAS_TRITON:
         return value.to(tl.float16)
 
     @triton.jit
-    def _exp2_from_ue8m0(byte):
-        """UE8M0 byte -> exact power of two in fp32 via IEEE bit assembly."""
-        e = (byte.to(tl.int32) - 127)
-        e = tl.minimum(tl.maximum(e, -126), 127)
-        bits = ((e + 127) << 23).to(tl.uint32)
-        return bits.to(tl.float32, bitcast=True)
-
-    @triton.jit
     def _grouped_w4a8_gemm(
         A, A_SCALE, B, B_SCALE, C,
         sorted_token_ids, expert_ids, num_tokens_post_padded,
@@ -161,6 +153,9 @@ if _HAS_TRITON:
             k_base = kb * 32
             # Even k lives in the low nibble and odd k in the high nibble, so
             # two K=16 FP16 dots (FP16 permits K=16) cover one scale block.
+            # Values stay unscaled inside the dot: E4M3 <= 448 and E2M1 <= 6 are
+            # exact in FP16, and folding the block scale in afterwards keeps
+            # large-magnitude intermediates (up to 1e7) out of FP16 range.
             a_even = tl.load(
                 A + tok[:, None] * stride_am + (k_base + 2 * offs_k16)[None, :] * stride_ak,
                 mask=m_mask[:, None], other=0.0,
@@ -169,13 +164,6 @@ if _HAS_TRITON:
                 A + tok[:, None] * stride_am + (k_base + 2 * offs_k16 + 1)[None, :] * stride_ak,
                 mask=m_mask[:, None], other=0.0,
             ).to(tl.float16)
-            ea = tl.load(
-                A_SCALE + tok * stride_sm + kb * stride_sk,
-                mask=m_mask, other=127,
-            )
-            a_scale = _exp2_from_ue8m0(ea)[:, None].to(tl.float16)
-            a_even = a_even * a_scale
-            a_odd = a_odd * a_scale
 
             pb = tl.load(
                 B + expert * stride_be + offs_n[:, None] * stride_bn
@@ -184,16 +172,22 @@ if _HAS_TRITON:
             )
             lo = _e2m1_nibble_to_f16(pb & 0x0F)
             hi = _e2m1_nibble_to_f16(pb >> 4)
+
+            partial = tl.dot(a_even, tl.trans(lo), out_dtype=tl.float32)
+            partial += tl.dot(a_odd, tl.trans(hi), out_dtype=tl.float32)
+
+            ea = tl.load(
+                A_SCALE + tok * stride_sm + kb * stride_sk,
+                mask=m_mask, other=127,
+            ).to(tl.int32)
             ew = tl.load(
                 B_SCALE + expert * stride_se + offs_n * stride_sn + kb,
                 mask=n_mask, other=127,
-            )
-            w_scale = _exp2_from_ue8m0(ew)[:, None].to(tl.float16)
-            lo = lo * w_scale
-            hi = hi * w_scale
-
-            acc += tl.dot(a_even, tl.trans(lo), out_dtype=tl.float32)
-            acc += tl.dot(a_odd, tl.trans(hi), out_dtype=tl.float32)
+            ).to(tl.int32)
+            e_pow = ea[:, None] + ew[None, :] - 254
+            e_pow = tl.minimum(tl.maximum(e_pow, -126), 127)
+            scale = ((e_pow + 127) << 23).to(tl.uint32).to(tl.float32, bitcast=True)
+            acc += partial * scale
 
         tl.store(
             C + tok[:, None] * stride_cm + offs_n[None, :] * stride_cn,
