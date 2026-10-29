@@ -28,6 +28,7 @@ from resin_models_cuda.deepseek_v41.attention import (
     store_attention_kv,
     store_kv,
 )
+from resin_models_cuda.deepseek_v41.cache import CacheRowFormat
 from resin_models_cuda.deepseek_v41.experts import MoE, MoEWeights, RoutedExperts
 from resin_models_cuda.deepseek_v41.hc import (
     HCLazyPost,
@@ -387,6 +388,7 @@ class Attention(nn.Module):
                 cache.compressed_cache(self.layer_id),
                 metadata.slot_mapping_store_ca[self.ratio],
                 compressed=True,
+                row_format=cache.geometry.row_format,
             )
         else:
             apply_rotary_emb(
@@ -395,7 +397,10 @@ class Attention(nn.Module):
             store_kv(
                 cache.compressed_cache(self.layer_id),
                 metadata.slot_mapping_store_ca[self.ratio],
-                pack_kv(latent, fp4=True),
+                pack_kv(
+                    latent,
+                    fp4=cache.geometry.row_format is CacheRowFormat.FP4,
+                ),
             )
 
     def prepare_shared_kv(self, hidden, positions, cache, runtime):

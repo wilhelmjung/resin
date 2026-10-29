@@ -11,6 +11,8 @@ if sys.platform == "linux":
     import tilelang.language as T
     import torch
 
+    from resin_models_cuda.deepseek_v41.cache import COMPRESSED_FP4_BYTES
+
     tilelang.set_log_level("WARNING")
 
     pass_configs = {
@@ -452,9 +454,8 @@ if sys.platform == "linux":
         return pre, post, comb
 
     @tilelang.jit(pass_configs=pass_configs)
-    def unpack_kv_kernel(page_tokens, row_bytes, page_stride):
+    def unpack_kv_kernel(page_tokens, row_bytes, page_stride, is_fp4):
         pages, rows = T.symbolic("pages"), T.symbolic("rows")
-        is_fp4 = row_bytes == 288
 
         @T.prim_func
         def run(
@@ -508,9 +509,11 @@ if sys.platform == "linux":
 
         return run
 
-    def unpack_kv(cache, indices):
+    def unpack_kv(cache, indices, *, fp4: Optional[bool] = None):
+        if fp4 is None:
+            fp4 = cache.shape[-1] == COMPRESSED_FP4_BYTES
         output = cache.new_empty(indices.numel(), 512, dtype=torch.bfloat16)
-        unpack_kv_kernel(cache.shape[1], cache.shape[-1], cache.stride(0))(
+        unpack_kv_kernel(cache.shape[1], cache.shape[-1], cache.stride(0), fp4)(
             cache, indices, output
         )
         return output

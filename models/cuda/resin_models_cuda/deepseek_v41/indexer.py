@@ -55,6 +55,7 @@ def store_index_kv(indexer, latent, cache, freqs, metadata, *, prefill=False):
 
     if not indexer.owns_k:
         raise ValueError("only an index-K source may store its projected keys")
+    index_format = cache.geometry.index_format
     transform(
         _projection(indexer, "wk", latent, prefill).reshape(-1, indexer.head_dim),
         norm_args=NormArgs(indexer.k_norm.weight, indexer.k_norm.eps),
@@ -65,7 +66,12 @@ def store_index_kv(indexer, latent, cache, freqs, metadata, *, prefill=False):
             False,
             offset=indexer.head_dim - indexer.rope_dim,
         ),
-        cast_args=CastArgs("e2m1", 32, round_sf=True, sf_format="ue8m0"),
+        cast_args=CastArgs(
+            index_format.quantized_dtype,
+            index_format.elements_per_sf,
+            round_sf=True,
+            sf_format=index_format.sf_format,
+        ),
         out_args=KVCacheOutArgs(
             cache.index_cache(indexer.layer),
             metadata.slot_mapping_store_ca[indexer.ratio].flatten(),
@@ -109,7 +115,13 @@ def paged_index(
         metadata = runtime["metadata"] = cache.prepare_metadata(positions)
     positions = metadata.positions
     cos_sin = _cos_sin(freqs)
-    cast_args = CastArgs("e2m1", 32, round_sf=True, sf_format="ue8m0")
+    index_format = cache.geometry.index_format
+    cast_args = CastArgs(
+        index_format.quantized_dtype,
+        index_format.elements_per_sf,
+        round_sf=True,
+        sf_format=index_format.sf_format,
+    )
     if indexer.owns_k and indexer.layer not in runtime.get("full_index_kv_stored", ()):
         store_index_kv(indexer, latent, cache, freqs, metadata, prefill=prefill)
     q, sf = cast(

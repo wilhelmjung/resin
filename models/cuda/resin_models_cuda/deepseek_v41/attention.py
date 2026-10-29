@@ -7,6 +7,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from resin.backend.cuda.mega_moe import prepare_weights
+from resin_models_cuda.deepseek_v41.cache import CacheRowFormat
 from resin_models_cuda.deepseek_v41.kernels import act_quant, fp4_act_quant, unpack_kv
 from resin_models_cuda.deepseek_v41.linear import PreparedLinear, weight_scale_rows
 
@@ -230,7 +231,16 @@ def project_input(attention, hidden):
     return attention.q_norm(query), kv
 
 
-def store_attention_kv(attention, value, positions, cache, slots, *, compressed=False):
+def store_attention_kv(
+    attention,
+    value,
+    positions,
+    cache,
+    slots,
+    *,
+    compressed=False,
+    row_format=CacheRowFormat.FP4,
+):
     """DeepInfer's one-pass RMSNorm/RoPE/quantization/paged store."""
     from resin_models_cuda.deepseek_v41.upstream.fused_transform import (
         CastArgs,
@@ -240,6 +250,8 @@ def store_attention_kv(attention, value, positions, cache, slots, *, compressed=
         fused_norm_rope_hadamard_cast_store_kvcache,
     )
 
+    # An FP8 compressed row stores the same V41 record as a window row.
+    compressed_fp4 = compressed and row_format is CacheRowFormat.FP4
     fused_norm_rope_hadamard_cast_store_kvcache(
         value.reshape(-1, attention.head_dim),
         norm_args=None
@@ -252,10 +264,10 @@ def store_attention_kv(attention, value, positions, cache, slots, *, compressed=
             is_neox=False,
         ),
         cast_args=CastArgs(
-            "e2m1" if compressed else "e4m3",
-            16 if compressed else 32,
-            round_sf=not compressed,
-            sf_format="e4m3" if compressed else "ue8m0",
+            "e2m1" if compressed_fp4 else "e4m3",
+            16 if compressed_fp4 else 32,
+            round_sf=not compressed_fp4,
+            sf_format="e4m3" if compressed_fp4 else "ue8m0",
         ),
         out_args=KVCacheOutArgs(cache, slots.flatten().int()),
     )

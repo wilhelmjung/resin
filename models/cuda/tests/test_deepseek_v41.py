@@ -15,7 +15,12 @@ from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLay
 from resin.backend.cuda.slab import DevicePageGroup
 from resin.backend.plans import PagedCachePlan
 from resin.models.deepseek_v41.config import DeepSeekV41Config
-from resin_models_cuda.deepseek_v41.cache import CacheArena, CacheGeometry
+from resin_models_cuda.deepseek_v41.cache import (
+    COMPRESSED,
+    CacheArena,
+    CacheGeometry,
+    CacheRowFormat,
+)
 from resin_models_cuda.deepseek_v41.checkpoint import DEFAULT_REVISION
 from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
 from resin_models_cuda.deepseek_v41.weights import _attention_shard, _dequantize_output
@@ -127,8 +132,10 @@ def _args():
     )
 
 
-def _cache(batch_size=1):
-    geometry = CacheGeometry.build(_args(), prefill_chunk_size=32)
+def _cache(batch_size=1, row_format=CacheRowFormat.FP4):
+    geometry = CacheGeometry.build(
+        _args(), prefill_chunk_size=32, row_format=row_format
+    )
     arena = CacheArena("cpu", geometry.layout(8), geometry, dtype=torch.bfloat16)
     groups = tuple(
         DevicePageGroup(
@@ -173,6 +180,62 @@ def test_shared_kv_and_index_pages_alias_only_their_declared_source():
     assert (index_values[index_pages, index_offsets] == 3).all()
     assert (index_scales[index_pages, index_offsets] == 4).all()
     assert arena.geometry.bytes_per_parent < 2 << 20
+
+
+@pytest.mark.parametrize(
+    ("row_format", "compressed_row_bytes", "index_row_bytes", "index_data_bytes"),
+    [
+        (CacheRowFormat.FP4, 288, 68, 64),
+        (CacheRowFormat.FP8, 528, 132, 128),
+    ],
+)
+def test_cache_row_formats_recompute_compressed_and_index_geometry(
+    row_format, compressed_row_bytes, index_row_bytes, index_data_bytes
+):
+    geometry = CacheGeometry.build(
+        _args(), prefill_chunk_size=32, row_format=row_format
+    )
+    assert geometry.row_format is row_format
+    assert geometry.compressed_bytes == compressed_row_bytes
+    assert geometry.index_bytes == index_row_bytes
+
+    _, cache = _cache(row_format=row_format)
+    compressed = cache.compressed_cache(1)
+    index = cache.index_cache(1)
+    tokens = index.shape[1]
+    assert compressed.shape[-1] == compressed_row_bytes
+    assert index.shape[-1] == index_row_bytes
+
+    values, scales = cache.index_parts(1)
+    assert values.shape == (index.shape[0], tokens, index_data_bytes)
+    assert scales.shape == (index.shape[0], tokens)
+
+    # Index pages are block-wide [data | scales] sections whose offsets and
+    # widths follow the selected row format instead of the FP4 defaults.
+    values[0, tokens - 1] = torch.arange(index_data_bytes, dtype=torch.int8) - 128
+    scales[0, tokens - 1] = 0x04030201
+    page = index[0, :, 0, :].flatten()
+    data_start = (tokens - 1) * index_data_bytes
+    assert torch.equal(
+        page[data_start : data_start + index_data_bytes],
+        values[0, tokens - 1].to(torch.uint8),
+    )
+    scale_start = tokens * index_data_bytes + (tokens - 1) * 4
+    assert page[scale_start : scale_start + 4].tolist() == [1, 2, 3, 4]
+
+
+def test_cache_geometry_defaults_to_fp4_rows_and_accepts_format_names():
+    default = CacheGeometry.build(_args(), prefill_chunk_size=32)
+    named = CacheGeometry.build(_args(), prefill_chunk_size=32, row_format="fp8")
+    assert default.row_format is CacheRowFormat.FP4
+    assert default == CacheGeometry.build(
+        _args(), prefill_chunk_size=32, row_format="fp4"
+    )
+    assert named.row_format is CacheRowFormat.FP8
+    assert named.compressed_bytes == 528
+    assert named.index_bytes == 132
+    assert default.packings[COMPRESSED] == 16
+    assert named.packings[COMPRESSED] == 8
 
 
 def test_compressor_and_ngram_rows_use_disjoint_slabs_and_exact_token_offsets():

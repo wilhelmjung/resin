@@ -2,6 +2,7 @@
 
 import math
 from dataclasses import dataclass, replace
+from enum import Enum
 
 import torch
 
@@ -16,11 +17,38 @@ from resin.backend.cuda.slab import (
     stage_page_groups,
 )
 from resin.backend.resources import CachePoolBinding
+from resin_models_cuda.deepseek_v41.upstream.cache_common import (
+    FP4_INDEX_KV_FORMAT,
+    MXFP8_INDEX_KV_FORMAT,
+    V41_FORMAT,
+    V41_FP4_FORMAT,
+)
 
 PAGE_TOKENS = 128
 WINDOW, COMPRESSED, COMPRESSOR, TOKENS = range(4)
-FP8_BYTES, FP4_BYTES = 528, 288
-INDEX_BYTES = 68  # 128 FP4 values plus four UE8M0 scales, block-wide sections.
+# Window/SWA/draft rows always stay FP8; only compressed and index rows downgrade.
+WINDOW_BYTES = V41_FORMAT.bytes_per_token
+COMPRESSED_FP4_BYTES = V41_FP4_FORMAT.bytes_per_token
+COMPRESSED_FP8_BYTES = V41_FORMAT.bytes_per_token
+INDEX_FP4_BYTES = FP4_INDEX_KV_FORMAT.bytes_per_token
+INDEX_FP8_BYTES = MXFP8_INDEX_KV_FORMAT.bytes_per_token
+
+
+class CacheRowFormat(Enum):
+    """Quantization tier shared by compressed KV and index rows."""
+
+    FP4 = "fp4"
+    FP8 = "fp8"
+
+
+COMPRESSED_FORMATS = {
+    CacheRowFormat.FP4: V41_FP4_FORMAT,
+    CacheRowFormat.FP8: V41_FORMAT,
+}
+INDEX_FORMATS = {
+    CacheRowFormat.FP4: FP4_INDEX_KV_FORMAT,
+    CacheRowFormat.FP8: MXFP8_INDEX_KV_FORMAT,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +66,7 @@ class CacheGeometry:
     draft_tokens: int
     max_batch_size: int = 1
     replay_suffix_tokens: int = 0
+    row_format: CacheRowFormat = CacheRowFormat.FP4
 
     @classmethod
     def build(
@@ -47,24 +76,28 @@ class CacheGeometry:
         prefill_chunk_size: int,
         max_batch_size: int = 1,
         replay_suffix_tokens: int = 0,
+        row_format: CacheRowFormat | str = CacheRowFormat.FP4,
         **_,
     ):
+        row_format = CacheRowFormat(row_format)
+        compressed_bytes = COMPRESSED_FORMATS[row_format].bytes_per_token
+        index_bytes = INDEX_FORMATS[row_format].bytes_per_token
         count = args.n_layers + args.n_mtp_layers
         ratios = tuple(args.compress_ratios)
         cursor, compressed, indices = 0, [None] * count, [None] * count
         for layer in args.kv_source_layers:
             compressed[layer] = cursor
-            cursor += PAGE_TOKENS // ratios[layer] * FP4_BYTES
+            cursor += PAGE_TOKENS // ratios[layer] * compressed_bytes
         for layer in args.kv_source_layers:
             indices[layer] = cursor
-            cursor += PAGE_TOKENS // ratios[layer] * INDEX_BYTES
+            cursor += PAGE_TOKENS // ratios[layer] * index_bytes
         for layer in range(args.n_layers):
             if ratios[layer]:
                 owner = next(x for x in reversed(args.kv_source_layers) if x <= layer)
                 compressed[layer], indices[layer] = compressed[owner], indices[owner]
         sources = tuple(x for x in args.kv_source_layers if ratios[x] > 1)
         sizes = (
-            count * PAGE_TOKENS * FP8_BYTES,
+            count * PAGE_TOKENS * WINDOW_BYTES,
             cursor,
             max(1, len(sources)) * PAGE_TOKENS * 2 * 512 * 4,
             PAGE_TOKENS * 8,
@@ -74,8 +107,8 @@ class CacheGeometry:
         # FlashMLA's flattened TMA coordinates divide each page stride by its
         # encoded row width. State/index/token aliases retain natural alignment.
         alignment = math.lcm(
-            packings[WINDOW] * FP8_BYTES,
-            packings[COMPRESSED] * math.lcm(FP4_BYTES, 256),
+            packings[WINDOW] * WINDOW_BYTES,
+            packings[COMPRESSED] * math.lcm(compressed_bytes, 256),
             packings[COMPRESSOR] * 2048,
             packings[TOKENS] * 8,
         )
@@ -97,7 +130,24 @@ class CacheGeometry:
             math.ceil(args.dspark_block_size / 8) * 8,
             max_batch_size,
             replay_suffix_tokens,
+            row_format,
         )
+
+    @property
+    def compressed_format(self):
+        return COMPRESSED_FORMATS[self.row_format]
+
+    @property
+    def index_format(self):
+        return INDEX_FORMATS[self.row_format]
+
+    @property
+    def compressed_bytes(self):
+        return self.compressed_format.bytes_per_token
+
+    @property
+    def index_bytes(self):
+        return self.index_format.bytes_per_token
 
     @property
     def graph_scratch_parents(self):
@@ -112,7 +162,8 @@ class CacheGeometry:
         return max(
             1,
             math.ceil(
-                self.max_batch_size * self.draft_tokens * FP8_BYTES / self.parent_bytes
+                self.max_batch_size * self.draft_tokens * WINDOW_BYTES
+                / self.parent_bytes
             ),
         )
 
@@ -203,7 +254,7 @@ class DeviceCache:
 
     def window_cache(self, layer):
         return self._view(
-            WINDOW, layer * PAGE_TOKENS * FP8_BYTES, PAGE_TOKENS, FP8_BYTES
+            WINDOW, layer * PAGE_TOKENS * WINDOW_BYTES, PAGE_TOKENS, WINDOW_BYTES
         )
 
     def compressed_cache(self, layer):
@@ -211,15 +262,18 @@ class DeviceCache:
         if offset is None:
             raise ValueError("layer does not consume shared compressed KV")
         return self._view(
-            COMPRESSED, offset, PAGE_TOKENS // self.geometry.ratios[layer], FP4_BYTES
+            COMPRESSED,
+            offset,
+            PAGE_TOKENS // self.geometry.ratios[layer],
+            self.geometry.compressed_bytes,
         )
 
     @property
     def draft_cache(self):
         tokens = self.geometry.draft_tokens
         return self.storage.as_strided(
-            (self.geometry.max_batch_size, tokens, 1, FP8_BYTES),
-            (tokens * FP8_BYTES, FP8_BYTES, FP8_BYTES, 1),
+            (self.geometry.max_batch_size, tokens, 1, WINDOW_BYTES),
+            (tokens * WINDOW_BYTES, WINDOW_BYTES, WINDOW_BYTES, 1),
             (self.storage.shape[0] - self.geometry.guard_parents)
             * self.geometry.parent_bytes,
         )
@@ -230,25 +284,30 @@ class DeviceCache:
         return self._rows(COMPRESSED, positions, self.geometry.ratios[layer])
 
     def index_cache(self, layer):
-        """DeepGEMM's FP4 index ABI: page-wide values followed by scales."""
+        """DeepGEMM's paged index ABI: page-wide values followed by scales."""
         offset = self.geometry.index_offsets[layer]
         if offset is None:
             raise ValueError("layer does not consume shared index keys")
         return self._view(
-            COMPRESSED, offset, PAGE_TOKENS // self.geometry.ratios[layer], INDEX_BYTES
+            COMPRESSED,
+            offset,
+            PAGE_TOKENS // self.geometry.ratios[layer],
+            self.geometry.index_bytes,
         )
 
     def index_parts(self, layer):
         """Typed zero-copy views used by the upstream fused cache-store kernel."""
         cache = self.index_cache(layer)
         pages, tokens = cache.shape[:2]
+        data_bytes = self.geometry.index_format.quantized_bytes
         values = self.storage.view(torch.int8).as_strided(
-            (pages, tokens, 64), (cache.stride(0), 64, 1), cache.storage_offset()
+            (pages, tokens, data_bytes), (cache.stride(0), data_bytes, 1),
+            cache.storage_offset(),
         )
         scales = self.storage.view(torch.int32).as_strided(
             (pages, tokens),
             (cache.stride(0) // 4, 1),
-            (cache.storage_offset() + tokens * 64) // 4,
+            (cache.storage_offset() + tokens * data_bytes) // 4,
         )
         return values, scales
 

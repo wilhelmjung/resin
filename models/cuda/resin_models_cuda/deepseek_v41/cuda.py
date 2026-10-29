@@ -109,6 +109,7 @@ class DeepSeekV41CudaRunner(CudaRunner):
         prefill_chunk_size: int = 4096,
         expert_backend: str = "flashinfer",
         allow_hopper: bool = False,
+        cache_row_format: str = "fp4",
         swa_replay_tokens: int = 140,
         swa_replay_mode: str = "compact",
     ) -> None:
@@ -116,6 +117,15 @@ class DeepSeekV41CudaRunner(CudaRunner):
             raise ValueError("swa_replay_tokens must be a nonnegative integer")
         if swa_replay_mode not in ("off", "mask", "compact"):
             raise ValueError("swa_replay_mode must be off, mask, or compact")
+        from resin_models_cuda.deepseek_v41.cache import CacheRowFormat
+
+        try:
+            self._cache_row_format = CacheRowFormat(cache_row_format)
+        except ValueError:
+            formats = ", ".join(member.value for member in CacheRowFormat)
+            raise ValueError(
+                f"cache_row_format must be one of {formats}"
+            ) from None
         self._swa_replay_tokens = swa_replay_tokens
         self._swa_replay_mode = swa_replay_mode
         if expert_backend not in ("flashinfer", "deepgemm"):
@@ -506,6 +516,7 @@ class DeepSeekV41CudaRunner(CudaRunner):
             prefill_chunk_size=self.prefill_chunk_size,
             max_batch_size=self.max_batch_size,
             replay_suffix_tokens=replay,
+            row_format=self._cache_row_format,
         )
 
     def _build_model(self, values):
