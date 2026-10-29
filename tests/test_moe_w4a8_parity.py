@@ -123,11 +123,51 @@ def test_l1_single_expert_gemm_parity():
 
     w_ref = dequant_expert(packed[0], scale[0]).float()
     ref = x_ref.cpu() @ w_ref.t()
-    cos = torch.nn.functional.cosine_similarity(out.flatten().cpu(), ref.flatten(), dim=0)
-    rel = (out - ref).norm() / ref.norm()
+    out_cpu = out.cpu()
+    cos = torch.nn.functional.cosine_similarity(out_cpu.flatten(), ref.flatten(), dim=0)
+    rel = (out_cpu - ref).norm() / ref.norm()
     assert cos.item() >= 0.99995, cos.item()
     assert rel.item() <= 1e-3, rel.item()
     assert torch.isfinite(out).all()
+
+
+def _quantized_moe_reference(
+    hidden, topk_ids, topk_weights, w13, w13_scale, w2, w2_scale, swiglu_limit
+):
+    """Same quantized math as the kernel path, executed in torch FP32.
+
+    Isolates kernel implementation error from the inherent MXFP8 quantization
+    loss (the latter is measured separately against the BF16 reference).
+    """
+    tokens, dim = hidden.shape
+    intermediate = w13.shape[1] // 2
+    w13_ref = torch.stack(
+        [dequant_expert(w13[e], w13_scale[e]).float() for e in range(w13.shape[0])]
+    )
+    w2_ref = torch.stack(
+        [dequant_expert(w2[e], w2_scale[e]).float() for e in range(w2.shape[0])]
+    )
+    a_q, a_s = act_quant_mxfp8(hidden, 32)
+    x = dequant_act(a_q, a_s)
+    rows = torch.arange(tokens * topk_ids.shape[1]) // topk_ids.shape[1]
+    c1 = torch.zeros(tokens * topk_ids.shape[1], 2 * intermediate)
+    for row, token in enumerate(rows.tolist()):
+        expert = int(topk_ids[token, row % topk_ids.shape[1]])
+        c1[row] = x[token] @ w13_ref[expert].t()
+    up, gate = c1[:, :intermediate], c1[:, intermediate:]
+    if swiglu_limit:
+        gate = gate.clamp(max=swiglu_limit)
+        up = up.clamp(-swiglu_limit, swiglu_limit)
+    inter = torch.nn.functional.silu(gate) * up
+    h_q, h_s = act_quant_mxfp8(inter.to(torch.bfloat16), 32)
+    hr = dequant_act(h_q, h_s)
+    c2 = torch.zeros(tokens * topk_ids.shape[1], dim)
+    for row, token in enumerate(rows.tolist()):
+        expert = int(topk_ids[token, row % topk_ids.shape[1]])
+        c2[row] = hr[row] @ w2_ref[expert].t()
+    out = torch.zeros(tokens, dim)
+    out.index_add_(0, rows, c2 * topk_weights.flatten()[:, None])
+    return out
 
 
 def _bf16_moe_reference(
@@ -168,7 +208,10 @@ def test_l2_single_layer_moe_parity(swiglu_limit):
     topk_ids = torch.randint(0, num_experts, (tokens, topk))
     topk_weights = torch.rand(tokens, topk) + 0.1
 
-    ref = _bf16_moe_reference(
+    ref = _quantized_moe_reference(
+        hidden, topk_ids, topk_weights, w13, w13_scale, w2, w2_scale, swiglu_limit
+    )
+    bf16_ref = _bf16_moe_reference(
         hidden, topk_ids, topk_weights, w13, w13_scale, w2, w2_scale, swiglu_limit
     )
 
@@ -178,8 +221,9 @@ def test_l2_single_layer_moe_parity(swiglu_limit):
         swiglu_limit=swiglu_limit,
     ).cpu()
 
-    cos = torch.nn.functional.cosine_similarity(out.flatten().cpu(), ref.flatten(), dim=0)
-    rel = (out - ref).norm() / ref.norm()
+    out_cpu = out.cpu()
+    cos = torch.nn.functional.cosine_similarity(out_cpu.flatten(), ref.flatten(), dim=0)
+    rel = (out_cpu - ref).norm() / ref.norm()
     assert cos.item() >= 0.9999, cos.item()
     assert rel.item() <= 0.02, rel.item()
     assert torch.isfinite(out).all()
