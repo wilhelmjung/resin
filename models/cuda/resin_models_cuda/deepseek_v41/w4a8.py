@@ -267,9 +267,11 @@ def w4a8_grouped_moe(
     intermediate = w13.shape[1] // 2
 
     a_q, a_s = act_quant_mxfp8(hidden, 32)
-    flat_ids = topk_ids.flatten().to(torch.int64)
-    a_q_exp = a_q[flat_ids // topk]
-    a_s_exp = a_s[flat_ids // topk]
+    flat_ids = topk_ids.flatten()
+    # Expanded row i belongs to token i // topk (flat_ids holds expert ids).
+    rows = torch.arange(tokens * topk, device=hidden.device) // topk
+    a_q_exp = a_q[rows]
+    a_s_exp = a_s[rows]
 
     sorted_ids, expert_ids, num_post = moe_align_block_size(
         topk_ids, block_m, num_experts
@@ -293,5 +295,5 @@ def w4a8_grouped_moe(
 
     out = torch.zeros((tokens, dim), dtype=torch.float32, device=hidden.device)
     weighted = c2 * topk_weights.flatten().float()[:, None]
-    out.index_add_(0, flat_ids // topk, weighted)
+    out.index_add_(0, rows, weighted)
     return out
