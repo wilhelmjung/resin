@@ -1,0 +1,143 @@
+"""H20 (SM90) sparse attention for DeepSeek-V4.1.
+
+Torch-side port of the dsv4.c sparse-prefill path (``src/model/layers.cpp``
+1179-1356) over SGLang's sm90 FlashMLA kernel. Correctness-first: the
+attention output stays BF16 and Wo_a runs as a torch einsum, so no FP8 packing
+archaeology is needed before the M1 parity gate; the FP8 ``fp8_einsum`` path
+(the fused Blackwell kernel's boundary) is a later performance step.
+
+Contract: docs/ATTENTION_H20_PORT_CONTRACT.md.
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+
+
+def pack_indices(indices: torch.Tensor, *, has_compressed: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack valid ids to the front and pad the width (dsv4.c:1240-1260).
+
+    ``indices`` is ``[rows, width]`` int32, ``-1`` means invalid. The kernel
+    only reads the first ``topk_length`` columns, so a hole in the prefix would
+    silently displace a window row; sorting the valid ids forward prevents
+    that. Width is padded to 128 (window-only) or 256 (with compressed rows),
+    which is the kernel's ``topk % (2*B_TOPK) == 0`` alignment assertion.
+    """
+    rows, width = indices.shape
+    idx = indices.int()
+    valid = idx >= 0
+    sentinel = width
+    key = torch.where(valid, torch.arange(width, device=idx.device).int(), sentinel)
+    perm = key.sort(dim=1).indices
+    idx = idx.gather(1, perm)
+    lens = valid.sum(1).int()
+    align = 256 if has_compressed else 128
+    pad = (align - width % align) % align
+    if pad:
+        idx = F.pad(idx, (0, pad), value=-1)
+    return idx.contiguous(), lens.contiguous()
+
+
+def _rope_slice(x: torch.Tensor, freqs: torch.Tensor, inverse: bool) -> torch.Tensor:
+    """Rotate-half rotary embedding on the last dim (``x[..., 2k]`` pairs)."""
+    shape = x.shape
+    xc = torch.view_as_complex(x.to(torch.float32).reshape(*shape[:-1], -1, 2))
+    f = freqs.conj() if inverse else freqs
+    return torch.view_as_real(xc * f.unsqueeze(-2)).reshape(shape).to(x.dtype)
+
+
+def apply_q_rope(
+    query: torch.Tensor, freqs_cis: torch.Tensor, positions: torch.Tensor, rope_dim: int
+) -> torch.Tensor:
+    """Rotary-embed the last ``rope_dim`` dims of ``query [T, heads, dim]``."""
+    flat_positions = positions.reshape(-1)
+    q = query.clone()
+    q[..., -rope_dim:] = _rope_slice(
+        q[..., -rope_dim:], freqs_cis[flat_positions.long()], inverse=False
+    )
+    return q
+
+
+def apply_inverse_output_rope(
+    output: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+) -> torch.Tensor:
+    """Un-rotate the rotary slice of the attention output before Wo_a.
+
+    DeepSeek-V4 / SGLang un-rotate the last 64 dims of attention head outputs
+    before the linear projection (dsv4.c:1354-1356).
+    """
+    flat_positions = positions.reshape(-1)
+    out = output.clone()
+    out[..., -rope_dim:] = _rope_slice(
+        out[..., -rope_dim:], freqs_cis[flat_positions.long()], inverse=True
+    )
+    return out
+
+
+def _pad_heads(value: torch.Tensor, sink: torch.Tensor | None):
+    """Pad heads to the kernel's supported set {64, 128}; pad the sink with zeros."""
+    heads = value.shape[1]
+    supported = 64 if heads <= 64 else 128
+    if supported != heads:
+        padded = torch.zeros(
+            value.shape[0], supported, value.shape[2], dtype=value.dtype, device=value.device
+        )
+        padded[:, :heads] = value
+        value = padded
+    if sink is not None:
+        s = sink.to(torch.float32).reshape(-1)
+        s_padded = torch.zeros(supported, dtype=torch.float32, device=s.device)
+        s_padded[: s.numel()] = s[:supported]
+        sink = s_padded
+    return value, sink
+
+
+def sparse_prefill_h20(
+    attention,
+    query: torch.Tensor,
+    positions: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    """Sparse prefill on sm90: ``flash_mla_sparse_fwd`` over a bf16 workspace.
+
+    ``query`` is ``[T, heads, head_dim]`` (pre-rope), ``kv`` is the gathered
+    bf16 workspace ``[N, head_dim]`` (window + compressed rows), ``indices`` is
+    ``[T, width]`` int32 rebased into ``kv`` with ``-1`` invalid. Returns bf16
+    ``[T, heads, head_dim]`` with the inverse output rope already applied.
+    """
+    from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+
+    tokens, heads, dim = query.shape
+    rope_dim = attention.rope_head_dim
+    q = apply_q_rope(query, attention.freqs_cis, positions, rope_dim)
+    packed, lens = pack_indices(indices.reshape(tokens, -1), has_compressed=bool(attention.ratio))
+    q_padded, sink = _pad_heads(q, getattr(attention, "attn_sink", None))
+    out = flash_mla_sparse_fwd(
+        q_padded.reshape(tokens, -1, dim).contiguous(),
+        kv.reshape(-1, 1, kv.shape[-1]).contiguous(),
+        packed[:, None, :],
+        float(attention.softmax_scale),
+        kv.shape[-1],
+        sink,
+        lens,
+    )[0]
+    out = out[:, :heads].to(query.dtype)
+    return apply_inverse_output_rope(out, attention.freqs_cis, positions, rope_dim)
+
+
+def wo_a_reference(attention, values: torch.Tensor) -> torch.Tensor:
+    """Grouped Wo_a as a torch einsum for the BF16 (correctness-first) path.
+
+    ``values`` is ``[T, heads, head_dim]``; the grouped weight is
+    ``[groups, rank, heads_per_group * head_dim]``. Returns FP32 ``[T, rank]``.
+    """
+    weight = attention.wo_a.weight  # [groups, rank, width]
+    groups, rank, width = weight.shape
+    tokens = values.shape[0]
+    flat = values.reshape(tokens, groups, width).float()
+    return torch.einsum("bgr,gdr->bd", flat, weight.float())
