@@ -227,3 +227,9 @@ def test_l2_single_layer_moe_parity(swiglu_limit):
     assert cos.item() >= 0.9999, cos.item()
     assert rel.item() <= 0.02, rel.item()
     assert torch.isfinite(out).all()
+    # Reported only: inherent MXFP8 loss vs a BF16 reference (shared with the
+    # production FlashInfer path; not a kernel-implementation gate).
+    quality = torch.nn.functional.cosine_similarity(
+        out_cpu.flatten(), bf16_ref.flatten(), dim=0
+    )
+    print(f"  mxfp8 quality vs bf16 reference: cos={quality.item():.6f}")
