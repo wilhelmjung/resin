@@ -108,6 +108,7 @@ class DeepSeekV41CudaRunner(CudaRunner):
         cache_parent_capacity: int | None = None,
         prefill_chunk_size: int = 4096,
         expert_backend: str = "flashinfer",
+        allow_hopper: bool = False,
         swa_replay_tokens: int = 140,
         swa_replay_mode: str = "compact",
     ) -> None:
@@ -199,8 +200,12 @@ class DeepSeekV41CudaRunner(CudaRunner):
             cuda_graph_decode=cuda_graph_decode,
         )
         torch.cuda.set_device(self.device)
-        if torch.cuda.get_device_capability(self.device)[0] < 10:
-            raise RuntimeError("the DeepSeek-V4.1 runner requires Blackwell")
+        capability = torch.cuda.get_device_capability(self.device)
+        if capability[0] < 10 and not (allow_hopper and capability[0] == 9):
+            raise RuntimeError(
+                "the DeepSeek-V4.1 runner requires Blackwell "
+                "(pass allow_hopper=True for experimental Hopper sm_90 support)"
+            )
         if parallel_groups is None and self.tensor_parallel_size > 1:
             if not dist.is_initialized():
                 raise RuntimeError(
