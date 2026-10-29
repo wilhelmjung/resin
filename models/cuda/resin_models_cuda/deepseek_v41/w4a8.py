@@ -149,7 +149,6 @@ if _HAS_TRITON:
         expert = tl.load(expert_ids + pid_m).to(tl.int64)
         offs_m = tl.arange(0, BLOCK_M)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        offs_k = tl.arange(0, 32)
         offs_k16 = tl.arange(0, 16)
 
         tok = tl.load(sorted_token_ids + pid_m * BLOCK_M + offs_m)
@@ -160,20 +159,24 @@ if _HAS_TRITON:
 
         for kb in range(0, K // 32):
             k_base = kb * 32
-            # Activation block: E4M3 values scaled by 2^(ea - 127), folded in
-            # FP16 (powers of two are exact) so one dot covers the block.
-            a = tl.load(
-                A + tok[:, None] * stride_am + (k_base + offs_k)[None, :] * stride_ak,
+            # Even k lives in the low nibble and odd k in the high nibble, so
+            # two K=16 FP16 dots (FP16 permits K=16) cover one scale block.
+            a_even = tl.load(
+                A + tok[:, None] * stride_am + (k_base + 2 * offs_k16)[None, :] * stride_ak,
+                mask=m_mask[:, None], other=0.0,
+            ).to(tl.float16)
+            a_odd = tl.load(
+                A + tok[:, None] * stride_am + (k_base + 2 * offs_k16 + 1)[None, :] * stride_ak,
                 mask=m_mask[:, None], other=0.0,
             ).to(tl.float16)
             ea = tl.load(
                 A_SCALE + tok * stride_sm + kb * stride_sk,
                 mask=m_mask, other=127,
             )
-            a = a * _exp2_from_ue8m0(ea)[:, None].to(tl.float16)
+            a_scale = _exp2_from_ue8m0(ea)[:, None].to(tl.float16)
+            a_even = a_even * a_scale
+            a_odd = a_odd * a_scale
 
-            # Weight block: unpack E2M1 nibbles (even k = low nibble), fold the
-            # row scale, then one FP16 dot into FP32 accumulators.
             pb = tl.load(
                 B + expert * stride_be + offs_n[:, None] * stride_bn
                 + (kb * 16 + offs_k16)[None, :] * stride_bk,
@@ -181,14 +184,16 @@ if _HAS_TRITON:
             )
             lo = _e2m1_nibble_to_f16(pb & 0x0F)
             hi = _e2m1_nibble_to_f16(pb >> 4)
-            w = tl.interleave(lo, hi)
             ew = tl.load(
                 B_SCALE + expert * stride_se + offs_n * stride_sn + kb,
                 mask=n_mask, other=127,
             )
-            w = w * _exp2_from_ue8m0(ew)[:, None].to(tl.float16)
+            w_scale = _exp2_from_ue8m0(ew)[:, None].to(tl.float16)
+            lo = lo * w_scale
+            hi = hi * w_scale
 
-            acc += tl.dot(a, tl.trans(w), out_dtype=tl.float32)
+            acc += tl.dot(a_even, tl.trans(lo), out_dtype=tl.float32)
+            acc += tl.dot(a_odd, tl.trans(hi), out_dtype=tl.float32)
 
         tl.store(
             C + tok[:, None] * stride_cm + offs_n[None, :] * stride_cn,
