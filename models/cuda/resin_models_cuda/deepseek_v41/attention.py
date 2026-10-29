@@ -183,6 +183,11 @@ class OutputProjection(nn.Module):
 
 def finish_output(attention, context):
     """Keep grouped values and packed scales paired until the final GEMM."""
+    if getattr(attention, "_h20", False):
+        from resin_models_cuda.deepseek_v41.attention_h20 import wo_a_reference
+
+        context = wo_a_reference(attention, context)
+        return attention.wo_b(context.to(attention.wo_b.weight.dtype))
     output = attention.wo_a(*context)
     value = (
         (output[0].flatten(1), output[1])
@@ -197,7 +202,28 @@ def _cos_sin(freqs):
     return torch.cat((freqs.real, freqs.imag), -1).contiguous()
 
 
+def attention_backend() -> str:
+    """Attention backend selection: ``fused`` (Blackwell FlashMLA) or ``h20``."""
+    import os
+
+    return os.environ.get("RESIN_ATTENTION_BACKEND", "fused").lower()
+
+
+def _prepare_attention_h20(attention):
+    """H20/SM90: plain torch projections and no fused KV-store buffer.
+
+    Skipping the ``cos_sin`` buffer also flips ``model.py``'s KV store to the
+    torch path (``kv_norm`` + ``apply_rotary_emb`` + ``pack_kv``), which only
+    needs ``act_quant``/``fp4_act_quant`` (tilelang, verified on sm90).
+    """
+    attention.project_query = attention.wq_b
+    attention._h20 = True
+
+
 def prepare_attention(attention):
+    if attention_backend() == "h20":
+        _prepare_attention_h20(attention)
+        return
     from resin_models_cuda.deepseek_v41.compressor import PreparedCompressor
 
     # DeepInfer merges these projections before lowering so their input cast
@@ -284,6 +310,25 @@ def fused_attention(
     extra_indices=None,
     prefill=False,
 ):
+    if getattr(attention, "_h20", False):
+        from resin_models_cuda.deepseek_v41.attention_h20 import (
+            sparse_decode_h20,
+            sparse_prefill_h20,
+        )
+
+        if prefill:
+            return sparse_prefill_h20(
+                attention, query, positions, cache.reshape(-1, cache.shape[-1]), indices
+            )
+        return sparse_decode_h20(
+            attention,
+            query,
+            positions,
+            cache,
+            indices,
+            extra_cache=extra_cache,
+            extra_indices=extra_indices,
+        )
     from flash_mla import fused_norm_rope_attn_rope_cast as fused
 
     common = (

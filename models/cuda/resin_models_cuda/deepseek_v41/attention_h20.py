@@ -133,11 +133,65 @@ def sparse_prefill_h20(
 def wo_a_reference(attention, values: torch.Tensor) -> torch.Tensor:
     """Grouped Wo_a as a torch einsum for the BF16 (correctness-first) path.
 
-    ``values`` is ``[T, heads, head_dim]``; the grouped weight is
-    ``[groups, rank, heads_per_group * head_dim]``. Returns FP32 ``[T, rank]``.
+    ``values`` is ``[T, heads, head_dim]``. The plain ``Linear`` weight is
+    ``[groups * rank, width]``; it is reshaped to ``[groups, rank, width]`` and
+    contracted per group. Returns FP32 ``[T, groups * rank]``.
     """
-    weight = attention.wo_a.weight  # [groups, rank, width]
-    groups, rank, width = weight.shape
+    weight = attention.wo_a.weight  # [groups * rank, width]
+    groups, rank = attention.n_local_groups, attention.o_lora_rank
+    width = weight.shape[1]
     tokens = values.shape[0]
     flat = values.reshape(tokens, groups, width).float()
-    return torch.einsum("bgr,gdr->bd", flat, weight.float())
+    return torch.einsum("bgr,gdr->bd", flat, weight.reshape(groups, rank, width).float())
+
+
+def sparse_decode_h20(
+    attention,
+    query: torch.Tensor,
+    positions: torch.Tensor,
+    window_cache: torch.Tensor,
+    swa_indices: torch.Tensor,
+    *,
+    extra_cache: torch.Tensor | None = None,
+    extra_indices: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Sparse decode on sm90: gather paged rows into a bf16 workspace, then
+    run the same ``flash_mla_sparse_fwd`` used by prefill (T rows, one per
+    decode step). Mathematically identical to the paged decode kernel: each
+    query attends its SWA window plus the compressed entries selected by the
+    indexer.
+
+    ``swa_indices``/``extra_indices`` are ``[T, n]`` paged slot ids (``-1``
+    invalid), matching ``metadata.kv_swa_index`` / ``metadata.compressed_indices``.
+    """
+    from resin_models_cuda.deepseek_v41.attention import gather_kv
+
+    tokens = query.shape[0]
+    window = gather_kv(window_cache, swa_indices)
+    n_window_rows = window.shape[0]
+    n_compressed = 0
+    pieces = [window]
+    if extra_cache is not None and extra_indices is not None and extra_indices.numel():
+        compressed = gather_kv(extra_cache, extra_indices)
+        n_compressed = compressed.shape[0]
+        pieces = [compressed, window]
+    kv = torch.cat(pieces)
+
+    win_width = swa_indices.shape[1]
+    rows = torch.arange(tokens, device=query.device)[:, None]
+    win_ids = torch.where(
+        swa_indices.reshape(tokens, -1) >= 0,
+        n_compressed + rows * win_width + torch.arange(win_width, device=query.device),
+        torch.full_like(swa_indices.reshape(tokens, -1), -1),
+    )
+    if n_compressed:
+        comp_width = extra_indices.shape[1]
+        comp_ids = torch.where(
+            extra_indices.reshape(tokens, -1) >= 0,
+            rows * comp_width + torch.arange(comp_width, device=query.device),
+            torch.full_like(extra_indices.reshape(tokens, -1), -1),
+        )
+        indices = torch.cat((comp_ids, win_ids), dim=1)
+    else:
+        indices = win_ids
+    return sparse_prefill_h20(attention, query, positions, kv, indices)
