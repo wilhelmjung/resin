@@ -236,9 +236,11 @@ class Indexer(nn.Module):
             args.candidate_topk_blocks,
             args.candidate_block_size,
         )
+        index_dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
         self.wq_b = Linear(
             args.q_lora_rank,
             args.index_n_heads * args.index_head_dim,
+            dtype=index_dtype,
             tensor_parallel=tp,
             axis=0,
         )
