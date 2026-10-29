@@ -219,6 +219,10 @@ def transform(name: str, tensor: torch.Tensor, partner: torch.Tensor | None,
         return tensor if fmt == "native" else None
     if fmt == "native":
         return tensor
+    if ".engram." in name:
+        # The Engram table and its projections are hard-wired FP8 + UE8M0 in
+        # the model (engram.py:192-194); keep them native in every tier.
+        return tensor
     if partner is not None and tensor.dtype == torch.float4_e2m1fn_x2:
         return dequant_fp4_packed(tensor, partner)
     if partner is not None and tensor.dtype == torch.float8_e4m3fn:
