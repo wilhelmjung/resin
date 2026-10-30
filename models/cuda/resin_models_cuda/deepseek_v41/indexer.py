@@ -19,7 +19,7 @@ def _weights_aligned(weights):
     return storage[:, :heads].copy_(weights)
 
 
-def _torch_mqa_scores(q, sf, kv, weights, lengths, request_ids, table, width):
+def _torch_mqa_scores(q, sf, kv, weights, lengths, request_ids, table, width, head_dim):
     """SM90 MQA scorer fallback: block-table gather + einsum (arch-free)."""
     from resin_models_cuda.deepseek_v41.kernels import unpack_kv
 
@@ -33,8 +33,7 @@ def _torch_mqa_scores(q, sf, kv, weights, lengths, request_ids, table, width):
         2.0, sf.view(torch.uint8).float() - 127.0
     ).unsqueeze(-1)
     heads = weights.shape[-1]
-    dim = q_deq.shape[-1] // 32 // heads * 32  # recover per-head width
-    q_deq = q_deq.reshape(n_rows, heads, -1)
+    q_deq = q_deq.reshape(n_rows, heads, head_dim)
     k_deq = (
         unpack_kv(kv, flat.reshape(-1).int())
         .float()
@@ -207,7 +206,7 @@ def paged_index(
             # beyond each query's klen keep the dtype minimum so topk's
             # end=lengths semantics are unchanged.
             scores = _torch_mqa_scores(
-                q, sf, kv, weights, lengths, request_ids, table, width
+                q, sf, kv, weights, lengths, request_ids, table, width, indexer.head_dim
             )
             n_blocks = scores.shape[1] // indexer.block_size
             row_ids = torch.arange(scores.shape[0], device=scores.device)
@@ -257,7 +256,7 @@ def paged_index(
             width = max(width, indexer.candidate_topk * indexer.block_size)
         if h20:
             scores = _torch_mqa_scores(
-                q, sf, kv, weights, lengths, request_ids, table, width
+                q, sf, kv, weights, lengths, request_ids, table, width, indexer.head_dim
             )
         else:
             scores = deep_gemm.fp8_fp4_paged_mqa_logits(
