@@ -129,7 +129,12 @@ def sparse_prefill_h20(
         lens,
     )[0]
     out = out[:, :heads].to(query.dtype)
-    return apply_inverse_output_rope(out, attention.freqs_cis, positions, rope_dim)
+    result = apply_inverse_output_rope(out, attention.freqs_cis, positions, rope_dim)
+    import os as _os
+
+    if _os.environ.get("RESIN_DEBUG_SHAPES"):
+        print("sparse_prefill_h20 out:", tuple(result.shape), "heads", heads)
+    return result
 
 
 def wo_a_reference(attention, values: torch.Tensor) -> torch.Tensor:
