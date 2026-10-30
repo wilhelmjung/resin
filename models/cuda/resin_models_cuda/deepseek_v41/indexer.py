@@ -156,28 +156,63 @@ def paged_index(
     if sparse:
         if candidates is None:
             raise RuntimeError("CED consumer executed before its candidate source")
-        if "sparse" not in schedules:
-            schedules["sparse"] = deep_gemm.get_paged_sparse_mqa_logits_metadata(
-                lengths,
+        import os
+
+        if os.environ.get("RESIN_ATTENTION_BACKEND", "fused").lower() == "h20":
+            # SM90 fallback: the sparse MQA scorer is SM100-only. Score the
+            # full index rows once, then mask everything outside the
+            # candidate blocks. Selection is equivalent to the sparse kernel;
+            # masked-out rows keep finite logits with ~zero softmax weight.
+            if "dense" not in schedules:
+                schedules["dense"] = deep_gemm.get_paged_mqa_logits_metadata(
+                    lengths[:, None],
+                    kv.shape[1],
+                    deep_gemm.get_num_sms(),
+                    indices=request_ids,
+                )
+            width = max(indexer.max_kv_len, indexer.topk)
+            scores = deep_gemm.fp8_fp4_paged_mqa_logits(
+                paged_q,
+                kv,
+                weights,
+                lengths[:, None],
                 table,
-                request_ids,
-                kv.shape[1],
-                candidates,
-                q.dtype,
+                schedules["dense"],
+                width,
+                indices=request_ids,
+            )
+            n_blocks = scores.shape[1] // indexer.block_size
+            row_ids = torch.arange(scores.shape[0], device=scores.device)
+            keep = torch.full(
+                (scores.shape[0], n_blocks), torch.finfo(scores.dtype).min,
+                dtype=scores.dtype, device=scores.device,
+            )
+            keep[row_ids[:, None], candidates.clamp_min(0)] = 0.0
+            scores = scores + keep.repeat_interleave(indexer.block_size, dim=1)
+            valid_lens = lengths
+        else:
+            if "sparse" not in schedules:
+                schedules["sparse"] = deep_gemm.get_paged_sparse_mqa_logits_metadata(
+                    lengths,
+                    table,
+                    request_ids,
+                    kv.shape[1],
+                    candidates,
+                    q.dtype,
+                    indexer.block_size,
+                )
+                schedules["compact_lens"] = get_candidate_compact_lens(
+                    candidates, lengths, indexer.block_size
+                )
+            scores = deep_gemm.fp8_fp4_paged_sparse_mqa_logits(
+                paged_q,
+                kv,
+                weights,
+                schedules["sparse"],
+                candidates.shape[1],
                 indexer.block_size,
             )
-            schedules["compact_lens"] = get_candidate_compact_lens(
-                candidates, lengths, indexer.block_size
-            )
-        scores = deep_gemm.fp8_fp4_paged_sparse_mqa_logits(
-            paged_q,
-            kv,
-            weights,
-            schedules["sparse"],
-            candidates.shape[1],
-            indexer.block_size,
-        )
-        valid_lens = schedules["compact_lens"]
+            valid_lens = schedules["compact_lens"]
     else:
         if "dense" not in schedules:
             schedules["dense"] = deep_gemm.get_paged_mqa_logits_metadata(
