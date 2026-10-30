@@ -26,7 +26,7 @@ def _torch_mqa_scores(q, sf, kv, weights, lengths, request_ids, table, width, he
     page = kv.shape[1]
     n_rows = q.shape[0]
     pages = (width + page - 1) // page
-    block = table[:pages].long()
+    block = table[:, :pages].long()  # table: [n_req, max_pages]
     offsets = torch.arange(width, device=q.device)
     flat = block[request_ids.long()] * page + offsets[None, :]
     q_deq = q.float().reshape(n_rows, -1, 32) * torch.pow(
