@@ -227,8 +227,10 @@ def transform(name: str, tensor: torch.Tensor, partner: torch.Tensor | None,
         return tensor if fmt == "native" else None
     if fmt == "native":
         return tensor
-    if partner is not None and tensor.dtype == torch.float4_e2m1fn_x2:
-        return dequant_fp4_packed(tensor, partner)
+    if partner is not None and ".ffn.experts." in name:
+        # Routed experts are MXFP4 in every tier; identify by name+partner,
+        # not dtype (safetensors may expose the packed view as uint8).
+        return dequant_fp4_packed(tensor.view(torch.uint8), partner)
     if partner is not None and tensor.dtype == torch.float8_e4m3fn:
         if ".engram.embed." in name:
             return dequant_row_block(tensor, partner)
