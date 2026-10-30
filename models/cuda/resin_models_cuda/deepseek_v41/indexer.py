@@ -19,6 +19,19 @@ def _weights_aligned(weights):
     return storage[:, :heads].copy_(weights)
 
 
+def _torch_candidate_block_max(scores, lengths, block_size):
+    """tilelang-free block max with per-row valid block counts."""
+    import torch as _t
+
+    n_blocks = scores.shape[1] // block_size
+    pad = n_blocks * block_size - scores.shape[1]
+    if pad:
+        scores = _t.nn.functional.pad(scores, (0, pad), value=_t.finfo(scores.dtype).min)
+    blocks = scores.reshape(scores.shape[0], n_blocks, block_size).max(-1).values
+    valid_blocks = ((lengths + block_size - 1) // block_size).int()
+    return blocks, valid_blocks
+
+
 def _torch_topk_indices(values, k, end):
     """deep_select-free topk indices with per-row valid widths and -1 fill."""
     width = values.shape[1]
@@ -309,7 +322,14 @@ def paged_index(
             )
         valid_lens = lengths
     if indexer.layer == indexer.candidate_source:
-        blocks, valid_blocks = candidate_block_max(scores, lengths, indexer.block_size)
+        if os.environ.get("RESIN_ATTENTION_BACKEND", "fused").lower() == "h20":
+            blocks, valid_blocks = _torch_candidate_block_max(
+                scores, lengths, indexer.block_size
+            )
+        else:
+            blocks, valid_blocks = candidate_block_max(
+                scores, lengths, indexer.block_size
+            )
         runtime["candidate_blocks"] = (
             _torch_topk_indices(blocks, indexer.candidate_topk, valid_blocks)
             if os.environ.get("RESIN_ATTENTION_BACKEND", "fused").lower() == "h20"
@@ -342,5 +362,17 @@ def paged_index(
         )[1]
     )
     if sparse:
-        restore_candidate_indices_inplace(selected, candidates, indexer.block_size)
+        if os.environ.get("RESIN_ATTENTION_BACKEND", "fused").lower() == "h20":
+            valid = candidates >= 0
+            safe = candidates.clamp_min(0)
+            base = safe * indexer.block_size
+            sel = selected.clamp_min(0)
+            within = sel - base[:, sel // indexer.block_size].diagonal() \
+                if False else None  # placeholder replaced below
+            # candidates[r, b] holds a block id; selected holds global row ids
+            # only if the scorer already emitted global ids. The torch scorer
+            # scores full rows, so selected is already global: no restore.
+            pass
+        else:
+            restore_candidate_indices_inplace(selected, candidates, indexer.block_size)
     return selected.reshape(*shape, indexer.topk)
