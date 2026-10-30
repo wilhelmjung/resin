@@ -25,26 +25,21 @@ def _torch_mqa_scores(q, sf, kv, weights, lengths, request_ids, table, width, he
 
     page = kv.shape[1]
     n_rows = q.shape[0]
-    pages = (width + page - 1) // page
-    block = table[:, :pages].long()  # table: [n_req, max_pages]
-    offsets = torch.arange(width, device=q.device)
-    import os as _os
-
-    if _os.environ.get("RESIN_DEBUG_SHAPES"):
-        print("scorer: table", tuple(table.shape), "pages", pages,
-              "block", tuple(block.shape), "req", tuple(request_ids.shape),
-              "offsets", tuple(offsets.shape), "width", width,
-              "q", tuple(q.shape), "kv", tuple(kv.shape))
-    flat = block[request_ids.long()] * page + offsets[None, :]
-    q_deq = q.float().reshape(n_rows, -1, 32) * torch.pow(
-        2.0, sf.view(torch.uint8).float() - 127.0
-    ).unsqueeze(-1)
     heads = weights.shape[-1]
+    offsets = torch.arange(width, device=q.device)
+    blocks = table.long()  # [n_req, max_pages]
+    per_query = blocks[request_ids.long()]  # [rows, max_pages]
+    page_idx, in_page = offsets // page, offsets % page
+    flat = per_query[:, page_idx] * page + in_page  # [rows, width]
+    scale = torch.pow(2.0, sf.view(torch.uint8).float() - 127.0)
+    q_deq = q.float().reshape(n_rows, heads, -1, 32) * scale.reshape(
+        n_rows, heads, -1, 1
+    )
     q_deq = q_deq.reshape(n_rows, heads, head_dim)
     k_deq = (
         unpack_kv(kv, flat.reshape(-1).int())
         .float()
-        .reshape(n_rows, width, heads, -1)
+        .reshape(n_rows, width, heads, head_dim)
     )
     scores = torch.einsum(
         "rhd,rwhd,rh->rw", q_deq, k_deq, weights.float()
