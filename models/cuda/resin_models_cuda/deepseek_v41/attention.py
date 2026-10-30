@@ -186,6 +186,10 @@ def finish_output(attention, context):
     if getattr(attention, "_h20", False):
         from resin_models_cuda.deepseek_v41.attention_h20 import wo_a_reference
 
+        import os as _os
+
+        if _os.environ.get("RESIN_DEBUG_SHAPES"):
+            print("finish_output context:", tuple(context.shape), type(context))
         context = wo_a_reference(attention, context)
         return attention.wo_b(context.to(attention.wo_b.weight.dtype))
     output = attention.wo_a(*context)
