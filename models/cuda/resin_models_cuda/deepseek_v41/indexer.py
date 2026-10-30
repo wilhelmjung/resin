@@ -38,13 +38,14 @@ def _torch_mqa_scores(q, sf, kv, weights, lengths, request_ids, table, width, he
     block = q.shape[-1] // sf.shape[-1]  # 32 (FP8) or 16 (FP4 index format)
     q_deq = q.float().reshape(n_rows, heads, -1, block) * scale[:, None, :, None]
     q_deq = q_deq.reshape(n_rows, heads, head_dim)
-    k_deq = (
-        unpack_kv(kv, flat.reshape(-1).int())
-        .float()
-        .reshape(n_rows, width, heads, head_dim)
+    # Index KV is single-head (MQA): one 128-wide row broadcast over heads.
+    k_deq = unpack_kv(kv, flat.reshape(-1).int()).float().reshape(
+        n_rows, width, kv.shape[-1] // 1 and unpack_width(kv)
+    ) if False else unpack_kv(kv, flat.reshape(-1).int()).float().reshape(
+        n_rows, width, -1
     )
     scores = torch.einsum(
-        "rhd,rwhd,rh->rw", q_deq, k_deq, weights.float()
+        "rhd,rwd,rh->rw", q_deq, k_deq, weights.float()
     ).to(torch.float32)
     beyond = offsets[None, :] >= lengths[:, None]
     scores = scores.masked_fill(beyond, torch.finfo(scores.dtype).min)
