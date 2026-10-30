@@ -28,6 +28,13 @@ def _torch_mqa_scores(q, sf, kv, weights, lengths, request_ids, table, width, he
     pages = (width + page - 1) // page
     block = table[:, :pages].long()  # table: [n_req, max_pages]
     offsets = torch.arange(width, device=q.device)
+    import os as _os
+
+    if _os.environ.get("RESIN_DEBUG_SHAPES"):
+        print("scorer: table", tuple(table.shape), "pages", pages,
+              "block", tuple(block.shape), "req", tuple(request_ids.shape),
+              "offsets", tuple(offsets.shape), "width", width,
+              "q", tuple(q.shape), "kv", tuple(kv.shape))
     flat = block[request_ids.long()] * page + offsets[None, :]
     q_deq = q.float().reshape(n_rows, -1, 32) * torch.pow(
         2.0, sf.view(torch.uint8).float() - 127.0
