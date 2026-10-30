@@ -32,10 +32,17 @@ def _torch_mqa_scores(q, sf, kv, weights, lengths, request_ids, table, width):
     q_deq = q.float().reshape(n_rows, -1, 32) * torch.pow(
         2.0, sf.view(torch.uint8).float() - 127.0
     ).unsqueeze(-1)
-    q_deq = q_deq.reshape(n_rows, -1)
-    k_deq = unpack_kv(kv, flat.reshape(-1).int()).float().reshape(n_rows, width, -1)
-    scores = torch.einsum("rd,rjd->rj", q_deq, k_deq).to(torch.float32)
-    scores = scores * weights.reshape(-1, 1)
+    heads = weights.shape[-1]
+    dim = q_deq.shape[-1] // 32 // heads * 32  # recover per-head width
+    q_deq = q_deq.reshape(n_rows, heads, -1)
+    k_deq = (
+        unpack_kv(kv, flat.reshape(-1).int())
+        .float()
+        .reshape(n_rows, width, heads, -1)
+    )
+    scores = torch.einsum(
+        "rhd,rwhd,rh->rw", q_deq, k_deq, weights.float()
+    ).to(torch.float32)
     beyond = offsets[None, :] >= lengths[:, None]
     scores = scores.masked_fill(beyond, torch.finfo(scores.dtype).min)
     return scores.contiguous()
