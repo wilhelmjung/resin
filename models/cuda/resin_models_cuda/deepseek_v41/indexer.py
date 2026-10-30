@@ -23,6 +23,11 @@ def _torch_mqa_scores(q, sf, kv, weights, lengths, request_ids, table, width, he
     """SM90 MQA scorer fallback: block-table gather + einsum (arch-free)."""
     from resin_models_cuda.deepseek_v41.kernels import unpack_kv
 
+    import os as _os
+
+    if _os.environ.get("RESIN_DEBUG_SHAPES"):
+        print("scorer entry: q", tuple(q.shape), "sf", tuple(sf.shape),
+              "weights", tuple(weights.shape), "kv", tuple(kv.shape))
     page = kv.shape[1]
     n_rows = q.shape[0]
     heads = weights.shape[-1]
@@ -34,16 +39,27 @@ def _torch_mqa_scores(q, sf, kv, weights, lengths, request_ids, table, width, he
     page_idx = (offsets // page).clamp(max=per_query.shape[1] - 1)
     in_page = offsets % page
     flat = per_query[:, page_idx] * page + in_page  # [rows, width]
+    # q arrives FP4-packed (128 dims -> 64 bytes) with one UE8M0 scale per
+    # head; unpack nibbles (even k = low) and fold the per-head scale.
     scale = torch.pow(2.0, sf.view(torch.uint8).float() - 127.0)
-    block = q.shape[-1] // sf.shape[-1]  # 32 (FP8) or 16 (FP4 index format)
-    q_deq = q.float().reshape(n_rows, heads, -1, block) * scale[:, None, :, None]
-    q_deq = q_deq.reshape(n_rows, heads, head_dim)
+    q_bytes = q.view(torch.uint8)
+    codes = torch.stack((q_bytes & 0x0F, q_bytes >> 4), dim=-1).flatten(2)
+    q_deq = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+         -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        device=q.device,
+    )[codes.long()] * scale[:, :, None]
     # Index KV is single-head (MQA): one 128-wide row broadcast over heads.
     k_deq = unpack_kv(kv, flat.reshape(-1).int()).float().reshape(
         n_rows, width, kv.shape[-1] // 1 and unpack_width(kv)
     ) if False else unpack_kv(kv, flat.reshape(-1).int()).float().reshape(
         n_rows, width, -1
     )
+    import os as _os
+
+    if _os.environ.get("RESIN_DEBUG_SHAPES"):
+        print("einsum shapes: q_deq", tuple(q_deq.shape), "k_deq",
+              tuple(k_deq.shape), "weights", tuple(weights.shape))
     scores = torch.einsum(
         "rhd,rwd,rh->rw", q_deq, k_deq, weights.float()
     ).to(torch.float32)
