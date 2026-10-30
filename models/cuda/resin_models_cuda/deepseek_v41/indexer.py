@@ -38,7 +38,15 @@ def _torch_mqa_scores(q, sf, kv, weights, lengths, request_ids, table, width, he
          -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
         device=q.device,
     )
-    q_deq = lut[codes.long()] * scale[:, :, None]  # [rows, heads, 128]
+    import os as _os
+
+    if _os.environ.get("RESIN_DEBUG_SHAPES"):
+        print("l41: q", tuple(q.shape), "sf", tuple(sf.shape),
+              "codes", tuple(codes.shape), "scale", tuple(scale.shape))
+    # Broadcast safely whatever the branch: flatten rows*heads, unscale rank.
+    q_flat = lut[codes.long()].reshape(-1, codes.shape[-1])
+    sc = scale.reshape(-1, 1)
+    q_deq = (q_flat * sc).reshape(*codes.shape[:2], codes.shape[-1])
 
     flat_rows = flat.reshape(-1)
     raw = kv[flat_rows // page, flat_rows % page, 0]  # [rows*width, 68]
