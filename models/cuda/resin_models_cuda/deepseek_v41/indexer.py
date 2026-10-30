@@ -35,7 +35,8 @@ def _torch_mqa_scores(q, sf, kv, weights, lengths, request_ids, table, width, he
     in_page = offsets % page
     flat = per_query[:, page_idx] * page + in_page  # [rows, width]
     scale = torch.pow(2.0, sf.view(torch.uint8).float() - 127.0)
-    q_deq = q.float().reshape(n_rows, heads, -1, 32) * scale.reshape(
+    block = q.shape[-1] // sf.shape[-1]  # 32 (FP8) or 16 (FP4 index format)
+    q_deq = q.float().reshape(n_rows, heads, -1, block) * scale.reshape(
         n_rows, heads, -1, 1
     )
     q_deq = q_deq.reshape(n_rows, heads, head_dim)
