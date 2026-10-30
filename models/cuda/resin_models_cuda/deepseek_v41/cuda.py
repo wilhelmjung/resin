@@ -574,10 +574,12 @@ class DeepSeekV41CudaRunner(CudaRunner):
                     value.squeeze(0) for value in attention._project(hidden[None])
                 )
 
-            def finish(values, scales, attention=attention):
+            def finish(*outputs, attention=attention):
                 from resin_models_cuda.deepseek_v41.attention import finish_output
 
-                return finish_output(attention, (values, scales))
+                # Fused outputs (values, scales); H20 emits a single tensor.
+                context = outputs if len(outputs) == 2 else outputs[0]
+                return finish_output(attention, context)
 
             query_outputs = (
                 TensorSpec((attention.n_local_heads * attention.head_dim,)),
