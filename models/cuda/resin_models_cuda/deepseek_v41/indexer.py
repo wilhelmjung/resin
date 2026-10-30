@@ -43,10 +43,17 @@ def _torch_mqa_scores(q, sf, kv, weights, lengths, request_ids, table, width, he
     if _os.environ.get("RESIN_DEBUG_SHAPES"):
         print("l41: q", tuple(q.shape), "sf", tuple(sf.shape),
               "codes", tuple(codes.shape), "scale", tuple(scale.shape))
-    # Broadcast safely whatever the branch: flatten rows*heads, unscale rank.
-    q_flat = lut[codes.long()].reshape(-1, codes.shape[-1])
-    sc = torch.pow(2.0, sf.view(torch.uint8).float() - 127.0).reshape(-1, 1)
-    q_deq = (q_flat * sc).reshape(*codes.shape[:2], codes.shape[-1])
+    vals = lut[codes.long()]
+    sf2 = torch.pow(2.0, sf.view(torch.uint8).float() - 127.0)
+    if sf2.numel() == n_rows * heads:
+        q_deq = vals.reshape(-1, vals.shape[-1]) * sf2.reshape(-1, 1)
+        q_deq = q_deq.reshape(*vals.shape)
+    elif sf2.numel() == n_rows * vals.shape[-1]:
+        q_deq = vals * sf2[:, None, :]
+    else:
+        per_block = vals.shape[-1] // sf2.shape[-1]
+        q_deq = vals.reshape(n_rows, heads, -1, per_block) * sf2[:, None, :, None]
+        q_deq = q_deq.reshape(*vals.shape)
 
     flat_rows = flat.reshape(-1)
     raw = kv[flat_rows // page, flat_rows % page, 0]  # [rows*width, 68]
