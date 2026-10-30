@@ -19,6 +19,28 @@ def _weights_aligned(weights):
     return storage[:, :heads].copy_(weights)
 
 
+def _torch_mqa_scores(q, sf, kv, weights, lengths, request_ids, table, width):
+    """SM90 MQA scorer fallback: block-table gather + einsum (arch-free)."""
+    from resin_models_cuda.deepseek_v41.kernels import unpack_kv
+
+    page = kv.shape[1]
+    n_rows = q.shape[0]
+    pages = (width + page - 1) // page
+    block = table[:pages].long()
+    offsets = torch.arange(width, device=q.device)
+    flat = block[request_ids.long()] * page + offsets[None, :]
+    q_deq = q.float().reshape(n_rows, -1, 32) * torch.pow(
+        2.0, sf.view(torch.uint8).float() - 127.0
+    ).unsqueeze(-1)
+    q_deq = q_deq.reshape(n_rows, -1)
+    k_deq = unpack_kv(kv, flat.reshape(-1).int()).float().reshape(n_rows, width, -1)
+    scores = torch.einsum("rd,rjd->rj", q_deq, k_deq).to(torch.float32)
+    scores = scores * weights.reshape(-1, 1)
+    beyond = offsets[None, :] >= lengths[:, None]
+    scores = scores.masked_fill(beyond, torch.finfo(scores.dtype).min)
+    return scores.contiguous()
+
+
 def index_metadata(cache, positions, ratio, runtime):
     """Share causal lengths and Engine page tables across index query sources."""
     metadata = runtime.setdefault("index_metadata", {})
@@ -93,6 +115,7 @@ def paged_index(
     prefill=False,
 ):
     import deep_gemm
+    import os
     from deep_select.interface import topk
 
     from resin_models_cuda.deepseek_v41.attention import _cos_sin
@@ -176,26 +199,9 @@ def paged_index(
             # dequantize both sides, and batch the dot products. Row counts
             # beyond each query's klen keep the dtype minimum so topk's
             # end=lengths semantics are unchanged.
-            from resin_models_cuda.deepseek_v41.kernels import unpack_kv
-
-            page = kv.shape[1]
-            n_rows = q.shape[0]
-            pages = (width + page - 1) // page
-            block = table[:pages].long()
-            offsets = torch.arange(width, device=q.device)
-            flat = block[request_ids.long()] * page + offsets[None, :]
-            q_deq = q.float().reshape(n_rows, -1, 32) * torch.pow(
-                2.0, sf.view(torch.uint8).float() - 127.0
-            ).unsqueeze(-1)
-            q_deq = q_deq.reshape(n_rows, -1)
-            k_deq = unpack_kv(kv, flat.reshape(-1).int()).float().reshape(
-                n_rows, width, -1
+            scores = _torch_mqa_scores(
+                q, sf, kv, weights, lengths, request_ids, table, width
             )
-            scores = torch.einsum("rd,rjd->rj", q_deq, k_deq).to(torch.float32)
-            scores = scores * weights.reshape(-1, 1)
-            beyond = offsets[None, :] >= lengths[:, None]
-            scores = scores.masked_fill(beyond, torch.finfo(scores.dtype).min)
-            scores = scores.contiguous()
             n_blocks = scores.shape[1] // indexer.block_size
             row_ids = torch.arange(scores.shape[0], device=scores.device)
             keep = torch.full(
@@ -241,16 +247,21 @@ def paged_index(
         width = max(indexer.max_kv_len, indexer.topk)
         if indexer.layer == indexer.candidate_source:
             width = max(width, indexer.candidate_topk * indexer.block_size)
-        scores = deep_gemm.fp8_fp4_paged_mqa_logits(
-            paged_q,
-            kv,
-            weights,
-            lengths[:, None],
-            table,
-            schedules["dense"],
-            width,
-            indices=request_ids,
-        )
+        if os.environ.get("RESIN_ATTENTION_BACKEND", "fused").lower() == "h20":
+            scores = _torch_mqa_scores(
+                q, sf, kv, weights, lengths, request_ids, table, width
+            )
+        else:
+            scores = deep_gemm.fp8_fp4_paged_mqa_logits(
+                paged_q,
+                kv,
+                weights,
+                lengths[:, None],
+                table,
+                schedules["dense"],
+                width,
+                indices=request_ids,
+            )
         valid_lens = lengths
     if indexer.layer == indexer.candidate_source:
         blocks, valid_blocks = candidate_block_max(scores, lengths, indexer.block_size)
