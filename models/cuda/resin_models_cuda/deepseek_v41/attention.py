@@ -214,8 +214,14 @@ def _prepare_attention_h20(attention):
 
     Skipping the ``cos_sin`` buffer also flips ``model.py``'s KV store to the
     torch path (``kv_norm`` + ``apply_rotary_emb`` + ``pack_kv``), which only
-    needs ``act_quant``/``fp4_act_quant`` (tilelang, verified on sm90).
+    needs ``act_quant``/``fp4_act_quant`` (tilelang, verified on sm90). The
+    compressor lowering is BF16/FP32-only and architecture-independent, and
+    the CUDA graph builder accesses ``compressor.projection`` directly.
     """
+    from resin_models_cuda.deepseek_v41.compressor import PreparedCompressor
+
+    if hasattr(attention, "compressor"):
+        attention.compressor = PreparedCompressor(attention.compressor)
     attention.project_query = attention.wq_b
     attention._h20 = True
 
