@@ -112,6 +112,8 @@ def sparse_prefill_h20(
     """
     from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
+    # Graph capture supplies a batched shape; flatten like the fused path.
+    query = query.reshape(-1, attention.n_local_heads, attention.head_dim)
     tokens, heads, dim = query.shape
     rope_dim = attention.rope_head_dim
     q = apply_q_rope(query, attention.freqs_cis, positions, rope_dim)
