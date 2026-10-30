@@ -19,6 +19,18 @@ def _weights_aligned(weights):
     return storage[:, :heads].copy_(weights)
 
 
+def _torch_topk_indices(values, k, end):
+    """deep_select-free topk indices with per-row valid widths and -1 fill."""
+    width = values.shape[1]
+    cols = torch.arange(width, device=values.device)
+    masked = values.masked_fill(
+        cols[None, :] >= end[:, None], torch.finfo(values.dtype).min
+    )
+    _, idx = masked.topk(k, dim=1)
+    idx = idx.masked_fill(idx >= end[:, None], -1)
+    return idx.to(torch.int32)
+
+
 def _torch_mqa_scores(q, sf, kv, weights, lengths, request_ids, table, width, head_dim):
     """SM90 MQA scorer fallback: hand FP4 unpack + per-head weighted einsum."""
     page = kv.shape[1]
@@ -298,29 +310,37 @@ def paged_index(
         valid_lens = lengths
     if indexer.layer == indexer.candidate_source:
         blocks, valid_blocks = candidate_block_max(scores, lengths, indexer.block_size)
-        runtime["candidate_blocks"] = topk(
-            blocks,
-            indexer.candidate_topk,
+        runtime["candidate_blocks"] = (
+            _torch_topk_indices(blocks, indexer.candidate_topk, valid_blocks)
+            if os.environ.get("RESIN_ATTENTION_BACKEND", "fused").lower() == "h20"
+            else topk(
+                blocks,
+                indexer.candidate_topk,
+                sorted=False,
+                end=valid_blocks,
+                indices_type=torch.int32,
+                sorted_index=True,
+                idx_oob_fill_value=-1,
+                return_value=False,
+            )[1]
+        )
+        # A new candidate source starts a fresh sparse schedule group.
+        schedules.pop("sparse", None)
+        schedules.pop("compact_lens", None)
+    selected = (
+        _torch_topk_indices(scores, indexer.topk, valid_lens)
+        if os.environ.get("RESIN_ATTENTION_BACKEND", "fused").lower() == "h20"
+        else topk(
+            scores,
+            indexer.topk,
             sorted=False,
-            end=valid_blocks,
+            end=valid_lens,
             indices_type=torch.int32,
             sorted_index=True,
             idx_oob_fill_value=-1,
             return_value=False,
         )[1]
-        # A new candidate source starts a fresh sparse schedule group.
-        schedules.pop("sparse", None)
-        schedules.pop("compact_lens", None)
-    selected = topk(
-        scores,
-        indexer.topk,
-        sorted=False,
-        end=valid_lens,
-        indices_type=torch.int32,
-        sorted_index=True,
-        idx_oob_fill_value=-1,
-        return_value=False,
-    )[1]
+    )
     if sparse:
         restore_candidate_indices_inplace(selected, candidates, indexer.block_size)
     return selected.reshape(*shape, indexer.topk)
