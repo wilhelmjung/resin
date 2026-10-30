@@ -357,7 +357,7 @@ class RoutedExperts(nn.Module):
                 dtype=torch.float32,
                 device=hidden.device,
             )
-            flat_weights = weights.float().flatten()
+            slot_weights = weights.float()
             for slot in range(indices.shape[-1]):
                 for expert in torch.unique(indices[:, slot]).tolist():
                     if not self.start <= expert < self.stop:
@@ -365,7 +365,7 @@ class RoutedExperts(nn.Module):
                     rows = (indices[:, slot] == expert).nonzero(as_tuple=True)[0]
                     local = int(expert - self.start)
                     value = self.experts[local](
-                        hidden[rows], flat_weights[rows, slot][:, None]
+                        hidden[rows], slot_weights[rows, slot][:, None]
                     )
                     out.index_add_(0, rows, value.float())
             return out
