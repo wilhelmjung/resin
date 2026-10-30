@@ -45,7 +45,7 @@ def _torch_mqa_scores(q, sf, kv, weights, lengths, request_ids, table, width, he
               "codes", tuple(codes.shape), "scale", tuple(scale.shape))
     # Broadcast safely whatever the branch: flatten rows*heads, unscale rank.
     q_flat = lut[codes.long()].reshape(-1, codes.shape[-1])
-    sc = scale.reshape(-1, 1)
+    sc = torch.pow(2.0, sf.view(torch.uint8).float() - 127.0).reshape(-1, 1)
     q_deq = (q_flat * sc).reshape(*codes.shape[:2], codes.shape[-1])
 
     flat_rows = flat.reshape(-1)
