@@ -222,7 +222,8 @@ def _prepare_attention_h20(attention):
 
     if hasattr(attention, "compressor"):
         attention.compressor = PreparedCompressor(attention.compressor)
-    attention.project_query = attention.wq_b
+    wq_b = attention.wq_b
+    attention.project_query = lambda qr: (wq_b(qr), None)
     attention._h20 = True
 
 
