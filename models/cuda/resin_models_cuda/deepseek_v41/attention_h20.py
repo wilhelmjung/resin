@@ -140,11 +140,11 @@ def wo_a_reference(attention, values: torch.Tensor) -> torch.Tensor:
     contracted per group. Returns FP32 ``[T, groups * rank]``.
     """
     weight = attention.wo_a.weight  # [groups * rank, width]
-    groups, rank = attention.n_local_groups, attention.o_lora_rank
+    groups = attention.n_local_groups
     width = weight.shape[1]
     tokens = values.shape[0]
-    flat = values.reshape(tokens, groups, width).float()
-    return torch.einsum("bgr,gdr->bd", flat, weight.reshape(groups, rank, width).float())
+    flat = values.reshape(tokens, groups * width).float()
+    return flat @ weight.float().t()
 
 
 def sparse_decode_h20(
