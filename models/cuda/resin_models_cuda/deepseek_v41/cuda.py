@@ -647,8 +647,10 @@ class DeepSeekV41CudaRunner(CudaRunner):
                 return values[0][None], values[1][None] if len(values) > 1 else None
 
             layer.attn.prefill_query = prefill_query
+            # Fused emits (values, scales); the H20 backend emits one tensor
+            # whose dim0 must NOT be unpacked into positional arguments.
             layer.attn.prefill_finish = lambda output, positions, invoke=finish: invoke(
-                *output
+                *output if isinstance(output, tuple) else (output,)
             )[None]
 
     def _configure_prefill_engram_graphs(self):
