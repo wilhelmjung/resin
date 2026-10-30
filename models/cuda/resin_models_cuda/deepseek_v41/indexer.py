@@ -23,6 +23,7 @@ def _torch_mqa_scores(q, sf, kv, weights, lengths, request_ids, table, width, he
     """SM90 MQA scorer fallback: hand FP4 unpack + per-head weighted einsum."""
     page = kv.shape[1]
     n_rows = q.shape[0]
+    heads = q.shape[1]
     offsets = torch.arange(width, device=q.device)
     blocks = table.long()
     per_query = blocks[request_ids.long()]
