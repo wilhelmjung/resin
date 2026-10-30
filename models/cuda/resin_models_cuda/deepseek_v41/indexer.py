@@ -235,7 +235,8 @@ def paged_index(
             )
             valid_lens = schedules["compact_lens"]
     else:
-        if "dense" not in schedules:
+        h20 = os.environ.get("RESIN_ATTENTION_BACKEND", "fused").lower() == "h20"
+        if "dense" not in schedules and not h20:
             schedules["dense"] = deep_gemm.get_paged_mqa_logits_metadata(
                 lengths[:, None],
                 kv.shape[1],
@@ -247,7 +248,7 @@ def paged_index(
         width = max(indexer.max_kv_len, indexer.topk)
         if indexer.layer == indexer.candidate_source:
             width = max(width, indexer.candidate_topk * indexer.block_size)
-        if os.environ.get("RESIN_ATTENTION_BACKEND", "fused").lower() == "h20":
+        if h20:
             scores = _torch_mqa_scores(
                 q, sf, kv, weights, lengths, request_ids, table, width
             )
