@@ -236,9 +236,11 @@ class Engram(nn.Module):
             layout.num_embeddings[self.layer_hash_index], layout.head_dim, lookup
         )
         self.hash_columns = (layout.max_ngram_size - 1) * layout.n_heads
+        wkv_dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
         self.wkv = Linear(
             (layout.max_ngram_size - 1) * layout.n_heads * layout.head_dim,
             args.dim * (args.hc_mult + 1),
+            dtype=wkv_dtype,
         )
         self.q_weight = nn.Parameter(torch.ones(args.hc_mult, args.dim))
         self.k_weight = nn.Parameter(torch.ones(args.hc_mult, args.dim))

@@ -218,10 +218,10 @@ class MiniPlan:
 def transform(name: str, tensor: torch.Tensor, partner: torch.Tensor | None,
               fmt: str) -> torch.Tensor | None:
     """Apply the format policy; None drops the tensor (bf16 drops scales)."""
-    if ".engram." in name:
-        # The Engram table and its projections are hard-wired FP8 + UE8M0 in
-        # the model (engram.py:192-194); keep them native in every tier, and
-        # keep their scales too (this must precede the generic scale drop).
+    if ".engram.embed." in name:
+        # The Engram lookup table is hard-wired FP8 + UE8M0 (engram.py:192-194)
+        # and consumed by fp8_embedding; keep it native (with its scale) in
+        # every tier. This must precede the generic scale drop.
         return tensor
     if name.endswith(".scale"):
         return tensor if fmt == "native" else None
