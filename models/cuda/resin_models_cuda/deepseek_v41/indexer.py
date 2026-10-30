@@ -171,22 +171,31 @@ def paged_index(
                     indices=request_ids,
                 )
             width = max(indexer.max_kv_len, indexer.topk)
-            # SM90 kernel takes a raw FP8 q and FP32 weights; fold the q block
-            # scale (power of two) into the weights. Uniform scaling preserves
-            # the top-k order, which is all this stage feeds downstream.
-            q_scale = torch.pow(
-                2.0, sf.view(torch.uint8).to(torch.float32) - 127.0
-            ).amax(dim=-1).unsqueeze(-1)
-            scores = deep_gemm.fp8_paged_mqa_logits(
-                q.reshape(-1, indexer.local_heads, indexer.head_dim),
-                kv,
-                (weights * q_scale).contiguous(),
-                lengths[:, None],
-                table,
-                schedules["dense"],
-                width,
-                indices=request_ids,
+            # SM90 torch scorer (the image's deep_gemm MQA family is all
+            # arch10-only): expand the block table into flat cache rows,
+            # dequantize both sides, and batch the dot products. Row counts
+            # beyond each query's klen keep the dtype minimum so topk's
+            # end=lengths semantics are unchanged.
+            from resin_models_cuda.deepseek_v41.kernels import unpack_kv
+
+            page = kv.shape[1]
+            n_rows = q.shape[0]
+            pages = (width + page - 1) // page
+            block = table[:pages].long()
+            offsets = torch.arange(width, device=q.device)
+            flat = block[request_ids.long()] * page + offsets[None, :]
+            q_deq = q.float().reshape(n_rows, -1, 32) * torch.pow(
+                2.0, sf.view(torch.uint8).float() - 127.0
+            ).unsqueeze(-1)
+            q_deq = q_deq.reshape(n_rows, -1)
+            k_deq = unpack_kv(kv, flat.reshape(-1).int()).float().reshape(
+                n_rows, width, -1
             )
+            scores = torch.einsum("rd,rjd->rj", q_deq, k_deq).to(torch.float32)
+            scores = scores * weights.reshape(-1, 1)
+            beyond = offsets[None, :] >= lengths[:, None]
+            scores = scores.masked_fill(beyond, torch.finfo(scores.dtype).min)
+            scores = scores.contiguous()
             n_blocks = scores.shape[1] // indexer.block_size
             row_ids = torch.arange(scores.shape[0], device=scores.device)
             keep = torch.full(
