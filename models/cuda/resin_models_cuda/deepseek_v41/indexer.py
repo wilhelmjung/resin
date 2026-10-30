@@ -171,10 +171,16 @@ def paged_index(
                     indices=request_ids,
                 )
             width = max(indexer.max_kv_len, indexer.topk)
-            scores = deep_gemm.fp8_fp4_paged_mqa_logits(
-                paged_q,
+            # SM90 kernel takes a raw FP8 q and FP32 weights; fold the q block
+            # scale (power of two) into the weights. Uniform scaling preserves
+            # the top-k order, which is all this stage feeds downstream.
+            q_scale = torch.pow(
+                2.0, sf.view(torch.uint8).to(torch.float32) - 127.0
+            ).amax(dim=-1).unsqueeze(-1)
+            scores = deep_gemm.fp8_paged_mqa_logits(
+                q.reshape(-1, indexer.local_heads, indexer.head_dim),
                 kv,
-                weights,
+                (weights * q_scale).contiguous(),
                 lengths[:, None],
                 table,
                 schedules["dense"],
